@@ -73,7 +73,7 @@ wandb/
 docs/server/
 
 # Local data sanity-check renders (large, regeneratable)
-docs/local_data_check/*.png
+docs/local_data_check/**/*.png
 
 # Notebook checkpoints
 .ipynb_checkpoints/

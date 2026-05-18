@@ -1,0 +1,43 @@
+# configs/detect/nndet_dataset.yaml
+# Pinned dataset-conversion configuration for STORY_01_01.
+#
+# This file drives scripts/build_nndet_dataset.py (server-side build).
+# Do NOT edit after the nnDetection dataset has been built and verified;
+# changes here would silently invalidate the reproducibility audit (§12).
+#
+# Source of truth for all values: STORY_01_01 story spec / NndetDatasetSpec.
+
+# nnDetection Task identity
+task_id: 1
+task_name: "Task001_TDSCABUS"
+
+# TDSC-ABUS-2023 split sizes (from official dataset description)
+n_train_cases: 100
+n_val_cases: 30
+n_test_cases: 70
+
+# Canonical physical voxel spacing, storage-axis order (d0, d1, d2), mm.
+# Source: docs/local_data.md, official TDSC-ABUS-2023 challenge description,
+# thesis §3.2.4. NEVER use the NRRD header spacing (placeholder identity).
+spacing_mm:
+  - 0.073
+  - 0.200
+  - 0.475674
+
+# Imaging modality string for nnDetection dataset.json
+modality: "US"
+
+# Foreground class description (thesis §3.2.1)
+label_semantics: "single foreground class: tumor"
+
+# Resampling target grid policy
+# "nndet_default" = nnDetection self-configuring fingerprint; no override.
+# Rationale: thesis §3.2.3/§3.2.4 — "internal optimisation of the candidate
+# generator beyond the framework defaults is explicitly out of scope."
+resampling_policy: "nndet_default"
+
+# nnDetection version and commit hash — FILLED IN DURING RUNBOOK EXECUTION
+# (see nndet_planning_notes.md and ASC-01_01.6).
+# Format: "v0.x.y" or a full commit hash from `git -C <nndet_dir> rev-parse HEAD`
+nndet_version: "TBD — fill in during /runbook 01.1 execution"
+nndet_commit_hash: "TBD — fill in during /runbook 01.1 execution"

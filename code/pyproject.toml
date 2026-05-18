@@ -79,8 +79,10 @@ mypy_path = "src"
 [[tool.mypy.overrides]]
 module = [
     "nrrd.*",
+    "pandas.*",
     "sklearn.*",
     "SimpleITK.*",
+    "yaml.*",
 ]
 ignore_missing_imports = true
 
