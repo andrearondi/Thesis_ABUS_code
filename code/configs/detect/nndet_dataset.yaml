@@ -39,5 +39,5 @@ resampling_policy: "nndet_default"
 # nnDetection version and commit hash — FILLED IN DURING RUNBOOK EXECUTION
 # (see nndet_planning_notes.md and ASC-01_01.6).
 # Format: "v0.x.y" or a full commit hash from `git -C <nndet_dir> rev-parse HEAD`
-nndet_version: "TBD — fill in during /runbook 01.1 execution"
-nndet_commit_hash: "TBD — fill in during /runbook 01.1 execution"
+nndet_version: 0.1
+nndet_commit_hash: 97a58f3110b71caf1b4bcc1851e67cf11e987fc5

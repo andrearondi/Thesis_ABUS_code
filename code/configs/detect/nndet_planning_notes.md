@@ -10,9 +10,20 @@ ASC-01_01.6 (version + commit hash) and ASC-01_01.4 (convention documentation).
 
 | Field | Value |
 |---|---|
-| nnDetection version | **TBD — paste `pip show nndet` output here** |
-| nnDetection commit hash | **TBD — paste `git -C <nndet_dir> rev-parse HEAD` here** |
-| Install date | TBD |
+| nnDetection version | Name: nndet
+Version: 0.1
+Summary: 
+Home-page: 
+Author: Division of Medical Image Computing, German Cancer Research Center
+Author-email: 
+License: 
+Location: /home/maia-user/Andre/nnDetection_src
+Editable project location: /home/maia-user/Andre/nnDetection_src
+Requires: batchgenerators, dicom2nifti, GitPython, hydra-core, loguru, matplotlib, medpy, mlflow, nevergrad, nnunet, pandas, python-gdcm, pytorch_lightning, PyYAML, scikit-image, scikit-learn, scipy, seaborn, SimpleITK, torchmetrics, tqdm
+Required-by: 
+ |
+| nnDetection commit hash | 97a58f3110b71caf1b4bcc1851e67cf11e987fc5 |
+| Install date | 18th May 2026 |
 | conda env | `/home/maia-user/Andre/envs/thesis` |
 
 **This must be filled in before STORY_01_02 trains anything.**
