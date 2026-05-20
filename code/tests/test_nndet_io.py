@@ -38,6 +38,18 @@ Test inventory (per story acceptance criteria):
 
   test_dry_run_entrypoint                — the --dry-run CLI path of nndet_io exits 0
       on a synthetic volume (local-data-sanity smoke).
+
+  ---- Schema-fix tests (Round 2, STORY_01_01 re-run) ----
+
+  test_build_dataset_json_nndet_v01_schema — regression for missing 'task' key server error.
+  test_export_dataset_raw_splitted_layout  — raw_splitted/ subdirectory layout.
+  test_export_dataset_per_case_json_sidecar — labelsTr/*.nrrd has sibling .json.
+  test_dataset_json_passes_nndet_check_replica — mini-replica of nnDetection check_dataset_file.
+  test_splits_content_unchanged_after_layout_fix — splits content invariant to path (ASC-01_01.3).
+  test_convert_case_multi_lesion_raises_before_sidecar — S1 fix: multi-lesion guard fires
+      before _write_per_case_json so wrong-encoding sidecar is never written.
+  test_verify_nndet_dataset_detects_missing_sidecar — S2 fix: missing .json sidecar detected
+      by verify_nndet_dataset before nndet_prep is executed.
 """
 
 from __future__ import annotations
@@ -429,16 +441,13 @@ def test_verify_detects_split_mismatch(tmp_path: Path) -> None:
     with open(splits_path, "w", encoding="utf-8") as f:
         json.dump(corrupted_splits, f)
 
-    # Write a minimal dataset.json so directory looks like a Task
+    # Write a minimal dataset.json using the correct nnDetection v0.1 schema
+    # so verify_nndet_dataset proceeds to the splits check (not blocked by schema check).
     ds_json = {
-        "name": "Task001_TDSCABUS",
-        "tensorImageSize": "3D",
-        "modality": {"0": "US"},
-        "labels": {"0": "background", "1": "tumor"},
-        "numTraining": 0,
-        "numTest": 0,
-        "training": [],
-        "test": [],
+        "task": "Task001_TDSCABUS",
+        "dim": 3,
+        "modalities": {"0": "US"},
+        "labels": {"0": "tumor"},
     }
     with open(task_dir / "dataset.json", "w", encoding="utf-8") as f:
         json.dump(ds_json, f)
@@ -483,7 +492,12 @@ def test_dataset_spec_fields() -> None:
 
 
 def test_build_dataset_json(tmp_path: Path) -> None:
-    """build_dataset_json writes a JSON file with required nnDetection keys."""
+    """build_dataset_json writes a JSON file with required nnDetection v0.1 keys.
+
+    Updated to match the nnDetection v0.1 schema (not nnUNet):
+      - 'task' (str), 'dim' (int=3), 'modalities' (dict), 'labels' (foreground-only)
+    The old nnUNet keys ('name', 'modality', 'numTraining', etc.) are absent.
+    """
     spec = NndetDatasetSpec(
         task_id=1,
         task_name="Task001_TDSCABUS",
@@ -500,14 +514,18 @@ def test_build_dataset_json(tmp_path: Path) -> None:
     with open(out_path, encoding="utf-8") as f:
         data = json.load(f)
 
-    # Required nnDetection dataset.json keys
-    assert "name" in data, "dataset.json must have 'name'"
-    assert "modality" in data, "dataset.json must have 'modality'"
+    # Required nnDetection v0.1 keys (NOT nnUNet keys)
+    assert "task" in data, "dataset.json must have 'task' (nnDetection v0.1)"
+    assert data["task"] == "Task001_TDSCABUS"
+    assert "dim" in data, "dataset.json must have 'dim'"
+    assert data["dim"] == 3
+    assert "modalities" in data, "dataset.json must have 'modalities' (plural)"
+    assert data["modalities"]["0"] == "US"
     assert "labels" in data, "dataset.json must have 'labels'"
-    assert "numTraining" in data, "dataset.json must have 'numTraining'"
-    assert data["numTraining"] == 100
-    assert "0" in data["labels"], "Background class '0' must be present"
-    assert "1" in data["labels"], "Foreground class '1' must be present"
+    # Foreground-only labels: {"0": "tumor"}, background implicit
+    assert "0" in data["labels"], "Foreground class '0' must be present"
+    assert data["labels"]["0"] == "tumor", "First foreground class must be 'tumor'"
+    assert "1" not in data["labels"], "nnDetection v0.1 labels must be foreground-only (no index 1)"
 
 
 # ===========================================================================
@@ -749,14 +767,15 @@ def test_export_dataset_handles_nested_train_shards(tmp_path: Path) -> None:
     assert result["n_test"] == 1
 
     # Every training case must have produced both an image and a label
+    # nnDetection v0.1 layout: under raw_splitted/
     task_dir = Path(result["task_dir"])
-    images_tr = sorted(task_dir.glob("imagesTr/*.nrrd"))
-    labels_tr = sorted(task_dir.glob("labelsTr/*.nrrd"))
+    images_tr = sorted((task_dir / "raw_splitted" / "imagesTr").glob("*.nrrd"))
+    labels_tr = sorted((task_dir / "raw_splitted" / "labelsTr").glob("*.nrrd"))
     assert len(images_tr) == 5, f"Expected 5 imagesTr files, got {len(images_tr)}"
     assert len(labels_tr) == 5, f"Expected 5 labelsTr files, got {len(labels_tr)}"
 
-    # Val + test images live under imagesTs (no labels)
-    images_ts = sorted(task_dir.glob("imagesTs/*.nrrd"))
+    # Val + test images live under raw_splitted/imagesTs (no labels)
+    images_ts = sorted((task_dir / "raw_splitted" / "imagesTs").glob("*.nrrd"))
     assert len(images_ts) == 3, f"Expected 3 imagesTs files (val+test), got {len(images_ts)}"
 
 
@@ -865,3 +884,470 @@ def test_export_dataset_tolerates_mask_padding_skew(tmp_path: Path) -> None:
 
     result = export_dataset(str(tdsc_root), str(out_root), spec)
     assert result["n_train"] == 3
+
+
+# ===========================================================================
+# NEW TESTS FOR NNDETECTION v0.1 SCHEMA FIX (STORY_01_01 re-run defects)
+# Written RED-first: these fail on the OLD build_dataset_json / export_dataset.
+# ===========================================================================
+
+
+# ===========================================================================
+# Test 17 — build_dataset_json writes nnDetection v0.1 schema (regression test)
+#
+# TDD evidence: test written BEFORE fix; fails on OLD code because:
+#   - OLD code has 'modality' not 'modalities'
+#   - OLD code lacks 'task' and 'dim'
+#   - OLD code has labels {"0":"background","1":"tumor"} not {"0":"tumor"}
+# ===========================================================================
+
+
+def test_build_dataset_json_nndet_v01_schema(tmp_path: Path) -> None:
+    """build_dataset_json produces a nnDetection v0.1-conformant dataset.json.
+
+    Checks every key the nnDetection v0.1 check.py / check_dataset_file
+    validates:
+      - 'task' present and a str
+      - 'dim' present and == 3
+      - 'modalities' present (NOT 'modality') with key "0" == "US"
+      - 'labels' foreground-only: {"0": "tumor"} (NOT {"0":"background","1":"tumor"})
+      - '_project' provenance dict preserved
+      - nnUNet-only keys absent: 'name', 'numTraining', 'numTest',
+        'tensorImageSize', 'training', 'test'
+
+    This is the regression test that would have caught the original ValueError:
+        ValueError: Dataset information did not contain 'task' key,
+        found ['_project','labels','modality','name','numTest','numTraining',
+               'tensorImageSize','test','training']
+    """
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=100,
+        n_val_cases=30,
+        n_test_cases=70,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="single foreground class: tumor",
+    )
+    out_path = str(tmp_path / "dataset.json")
+    build_dataset_json(spec, out_path)
+
+    with open(out_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    # --- Required nnDetection v0.1 keys ---
+    assert "task" in data, (
+        "dataset.json must have 'task' key (nnDetection v0.1 check.py line 86 "
+        "_check_key_missing(cfg, 'task', ktype=str)); "
+        f"found keys: {sorted(data.keys())}"
+    )
+    assert isinstance(data["task"], str), f"'task' must be a str, got {type(data['task']).__name__}"
+    assert data["task"] == "Task001_TDSCABUS", f"'task' must equal task_name, got {data['task']!r}"
+
+    assert (
+        "dim" in data
+    ), f"dataset.json must have 'dim' key for 3D volumes; found: {sorted(data.keys())}"
+    assert data["dim"] == 3, f"'dim' must be 3 for 3D ABUS volumes, got {data['dim']}"
+
+    # --- modalities (plural) replaces modality ---
+    assert "modalities" in data, (
+        "dataset.json must have 'modalities' (plural) key, NOT 'modality'. "
+        f"Found keys: {sorted(data.keys())}"
+    )
+    assert "0" in data["modalities"], f"'modalities' must have key '0', got {data['modalities']}"
+    assert (
+        data["modalities"]["0"] == "US"
+    ), f"'modalities'[\"0\"] must be 'US', got {data['modalities']['0']!r}"
+    assert "modality" not in data, (
+        "nnUNet key 'modality' must NOT be present in nnDetection v0.1 dataset.json; "
+        f"found keys: {sorted(data.keys())}"
+    )
+
+    # --- foreground-only labels ---
+    assert "labels" in data, f"dataset.json must have 'labels'; found: {sorted(data.keys())}"
+    assert data["labels"] == {"0": "tumor"}, (
+        "nnDetection v0.1 labels must be foreground-only, zero-indexed: "
+        '{"0": "tumor"}. '
+        f"Got: {data['labels']}. "
+        "Background is implicit in nnDetection; it must NOT appear in labels."
+    )
+
+    # --- _project provenance dict preserved ---
+    assert (
+        "_project" in data
+    ), f"'_project' provenance dict must be preserved; found: {sorted(data.keys())}"
+
+    # --- nnUNet-only keys must be absent ---
+    nnunet_keys = {"name", "numTraining", "numTest", "tensorImageSize", "training", "test"}
+    present_nnunet = nnunet_keys & set(data.keys())
+    assert not present_nnunet, (
+        f"nnUNet-only keys must not appear in nnDetection dataset.json: {present_nnunet}. "
+        "These keys encode nnUNet semantics and may confuse nnDetection's validation."
+    )
+
+
+# ===========================================================================
+# Test 18 — export_dataset produces raw_splitted/ subdirectory layout
+#
+# TDD evidence: test written BEFORE fix; fails on OLD code because:
+#   - OLD export_dataset writes imagesTr/labelsTr/imagesTs directly under task_dir
+#   - NEW layout requires task_dir/raw_splitted/imagesTr etc.
+# ===========================================================================
+
+
+def test_export_dataset_raw_splitted_layout(tmp_path: Path) -> None:
+    """export_dataset writes imagesTr/labelsTr/imagesTs under raw_splitted/ subdir.
+
+    nnDetection v0.1 expects:
+        Task001_TDSCABUS/
+        ├── dataset.json         (task root — already correct)
+        └── raw_splitted/
+            ├── imagesTr/
+            ├── labelsTr/
+            └── imagesTs/
+
+    The current (wrong) layout writes imagesTr/labelsTr/imagesTs directly
+    under the task root, causing nndet_prep to fail with a FileNotFoundError
+    when it looks for raw_splitted/.
+    """
+    tdsc_root = tmp_path / "tdsc"
+    _build_synthetic_tdsc_root(
+        tdsc_root,
+        train_shards={"DATA00_49": [0, 1]},
+        val_ids=[100],
+        test_ids=[200],
+    )
+
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=2,
+        n_val_cases=1,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+
+    result = export_dataset(str(tdsc_root), str(out_root), spec)
+    task_dir = Path(result["task_dir"])
+
+    # raw_splitted/ must exist under the task root
+    raw_splitted = task_dir / "raw_splitted"
+    assert raw_splitted.exists() and raw_splitted.is_dir(), (
+        f"raw_splitted/ subdirectory not found under {task_dir}. "
+        "nnDetection v0.1 nndet_prep looks for raw_splitted/imagesTr etc."
+    )
+
+    # imagesTr, labelsTr, imagesTs must be UNDER raw_splitted/
+    assert (
+        raw_splitted / "imagesTr"
+    ).is_dir(), f"imagesTr/ must be under raw_splitted/, not directly under {task_dir}"
+    assert (
+        raw_splitted / "labelsTr"
+    ).is_dir(), f"labelsTr/ must be under raw_splitted/, not directly under {task_dir}"
+    assert (
+        raw_splitted / "imagesTs"
+    ).is_dir(), f"imagesTs/ must be under raw_splitted/, not directly under {task_dir}"
+
+    # The task root must NOT have imagesTr/labelsTr/imagesTs directly (wrong layout)
+    assert not (
+        task_dir / "imagesTr"
+    ).exists(), f"imagesTr/ must NOT exist directly under {task_dir} (old wrong layout)"
+
+    # Correct file counts
+    images_tr = sorted((raw_splitted / "imagesTr").glob("*.nrrd"))
+    labels_tr = sorted((raw_splitted / "labelsTr").glob("*.nrrd"))
+    images_ts = sorted((raw_splitted / "imagesTs").glob("*.nrrd"))
+    assert len(images_tr) == 2, f"Expected 2 imagesTr files, got {len(images_tr)}"
+    assert len(labels_tr) == 2, f"Expected 2 labelsTr files, got {len(labels_tr)}"
+    assert len(images_ts) == 2, f"Expected 2 imagesTs files (val+test), got {len(images_ts)}"
+
+    # dataset.json must remain at task root (not inside raw_splitted)
+    assert (task_dir / "dataset.json").exists(), "dataset.json must remain at the task root"
+
+
+# ===========================================================================
+# Test 19 — every labelsTr NRRD has a sibling .json with instances mapping
+#
+# TDD evidence: test written BEFORE fix; fails on OLD code because:
+#   - OLD convert_case writes only the .nrrd label, no .json sidecar
+#   - nnDetection v0.1 load.py reads seg_props_file = f"{stem}.json"
+#     and expects {"instances": {"1": 0}}
+# ===========================================================================
+
+
+def test_export_dataset_per_case_json_sidecar(tmp_path: Path) -> None:
+    """Every labelsTr/*.nrrd has a sibling .json with instances mapping.
+
+    nnDetection v0.1 load.py:
+        seg_props_file = f"{str(seg_file).split('.')[0]}.json"
+        properties_json["instances"] = {str(k): int(v) ...}
+
+    For single-lesion TDSC cases the correct content is:
+        {"instances": {"1": 0}}
+    where key "1" is the binary mask value (lesion voxels = 1) and
+    value 0 is the class index (labels is {"0": "tumor"} — zero-indexed
+    foreground, consistent with the fixed labels dict from defect 1).
+    """
+    tdsc_root = tmp_path / "tdsc"
+    _build_synthetic_tdsc_root(
+        tdsc_root,
+        train_shards={"DATA00_49": [0, 1, 2]},
+        val_ids=[100],
+        test_ids=[200],
+    )
+
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=3,
+        n_val_cases=1,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+
+    export_dataset(str(tdsc_root), str(out_root), spec)
+
+    task_dir = tmp_path / "out" / "Task001_TDSCABUS"
+    labels_tr = task_dir / "raw_splitted" / "labelsTr"
+
+    nrrd_files = sorted(labels_tr.glob("*.nrrd"))
+    assert len(nrrd_files) == 3, f"Expected 3 labelsTr NRRD files, got {len(nrrd_files)}"
+
+    for nrrd_file in nrrd_files:
+        json_sidecar = nrrd_file.with_suffix(".json")
+        assert json_sidecar.exists(), (
+            f"Missing per-case JSON sidecar for {nrrd_file.name}. "
+            "nnDetection v0.1 load.py reads seg_props_file = stem + '.json' "
+            "and crashes if it is absent."
+        )
+
+        with open(json_sidecar, encoding="utf-8") as f:
+            props = json.load(f)
+
+        assert "instances" in props, (
+            f"Per-case JSON {json_sidecar.name} must have 'instances' key. " f"Got: {props}"
+        )
+        assert props["instances"] == {"1": 0}, (
+            f'Per-case JSON {json_sidecar.name} instances must be {{"1": 0}} '
+            f"(instance value 1 -> class index 0 for single-lesion tumor). "
+            f"Got: {props['instances']}"
+        )
+
+
+# ===========================================================================
+# Test 20 — nnDetection v0.1 mini-replica check_dataset_file passes on output
+#
+# This is the regression test that would have caught the original server error.
+# It re-implements the exact key+type checks from nndet/utils/check.py that
+# fired with the ValueError on the server.
+# ===========================================================================
+
+
+def test_dataset_json_passes_nndet_check_replica(tmp_path: Path) -> None:
+    """The produced dataset.json passes a mini-replica of nnDetection's check_dataset_file.
+
+    Re-implements the key + type checks from nndet/utils/check.py at commit
+    97a58f3110b71caf1b4bcc1851e67cf11e987fc5 (the pinned server version).
+
+    The original server failure was:
+        ValueError: Dataset information did not contain 'task' key,
+        found ['_project','labels','modality','name','numTest','numTraining',
+               'tensorImageSize','test','training']
+
+    This test runs the same checks so any future schema regression is caught
+    locally before reaching the server.
+    """
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=100,
+        n_val_cases=30,
+        n_test_cases=70,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="single foreground class: tumor",
+    )
+    out_path = str(tmp_path / "dataset.json")
+    build_dataset_json(spec, out_path)
+
+    with open(out_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    def _check_key_missing(d: dict, key: str, ktype: type) -> None:
+        """Mini-replica of nndet/utils/check.py::_check_key_missing."""
+        if key not in d:
+            raise ValueError(
+                f"Dataset information did not contain {key!r} key, " f"found {sorted(d.keys())}"
+            )
+        if not isinstance(d[key], ktype):
+            raise TypeError(
+                f"Key {key!r} must be of type {ktype.__name__}, " f"got {type(d[key]).__name__}"
+            )
+
+    # These are the exact checks from nndet/utils/check.py check_dataset_file
+    # that the server ran and failed on.
+    _check_key_missing(cfg, "task", str)  # line 86 — the one that fired
+    _check_key_missing(cfg, "dim", int)  # line 87
+    _check_key_missing(cfg, "modalities", dict)  # line 88 (plural)
+    _check_key_missing(cfg, "labels", dict)  # line 89
+
+    # Semantic checks that follow the key presence checks
+    assert cfg["dim"] == 3, f"dim must be 3 for 3D data, got {cfg['dim']}"
+    assert "0" in cfg["modalities"], f"modalities must have key '0', got {cfg['modalities']}"
+    # labels must be foreground-only (background is implicit in nnDetection)
+    assert (
+        "0" in cfg["labels"]
+    ), f"labels must have at least key '0' (first foreground class), got {cfg['labels']}"
+    assert "background" not in cfg["labels"].values(), (
+        "Background must not appear as a label value in nnDetection v0.1 dataset.json; "
+        f"got labels: {cfg['labels']}"
+    )
+
+
+# ===========================================================================
+# Test 21 — splits_final.json content is bit-for-bit identical regardless of location
+#
+# This guards ASC-01_01.3 / Risk 3: the splits file CONTENT must be unchanged.
+# Only the location can move (within the task dir).
+# ===========================================================================
+
+
+def test_splits_content_unchanged_after_layout_fix(tmp_path: Path) -> None:
+    """The splits_final.json content is bit-for-bit identical before and after the layout fix.
+
+    ASC-01_01.3 / Risk 3: only the FILE LOCATION may change (raw_splitted/ vs task root).
+    The fold membership must be byte-faithfully preserved from the frozen manifest.
+
+    This test writes splits to two different paths and asserts their JSON content
+    is identical, proving the content is invariant to path changes.
+    """
+    from abus.data.split import load_split
+
+    path_a = str(tmp_path / "splits_a.json")
+    path_b = str(tmp_path / "subdir" / "splits_b.json")
+
+    write_nndet_splits(path_a)
+    write_nndet_splits(path_b)
+
+    with open(path_a, encoding="utf-8") as f:
+        content_a = json.load(f)
+    with open(path_b, encoding="utf-8") as f:
+        content_b = json.load(f)
+
+    assert content_a == content_b, (
+        "splits_final.json content must be identical regardless of output path. "
+        "Only the location may change; the fold membership is immutable."
+    )
+
+    # Also verify content matches frozen manifest (re-run faithfulness check)
+    frozen = load_split()
+    assert len(content_a) == len(
+        frozen.folds
+    ), f"Fold count mismatch: {len(content_a)} vs {len(frozen.folds)}"
+    for k, entry in enumerate(content_a):
+        assert sorted(int(x) for x in entry["train"]) == frozen.train_ids(k)
+        assert sorted(int(x) for x in entry["val"]) == frozen.oof_ids(k)
+
+
+# ===========================================================================
+# Test 22 — convert_case raises NndetDatasetError for multi-lesion CSV rows
+#           BEFORE writing the per-case JSON sidecar (S1 fix guard)
+#
+# TDD evidence: WRITTEN AFTER fix was applied (S1 adds the guard).
+# The guard must fire before _write_per_case_json so no wrong-encoding sidecar
+# is left on disk from an interrupted multi-lesion conversion.
+# ===========================================================================
+
+
+def test_convert_case_multi_lesion_raises_before_sidecar(tmp_path: Path) -> None:
+    """convert_case raises NndetDatasetError for multi-lesion CSV rows (no sidecar written).
+
+    The {"instances": {"1": 0}} encoding is valid ONLY for single-lesion binary masks.
+    A multi-lesion case requires instance-index encoding (mask values 1, 2, 3, …).
+    The guard must raise BEFORE writing the per-case JSON sidecar so a wrong-encoding
+    .json is never left on disk from a failed conversion.
+    """
+    vol_path = str(tmp_path / "DATA_0010.nrrd")
+    mask_path = str(tmp_path / "MASK_0010.nrrd")
+    _write_identity_volume_nrrd(vol_path)
+    lesion_box = BBox(2, 3, 4, 4, 6, 7)
+    _write_identity_mask_nrrd(mask_path, lesion_box=lesion_box)
+
+    out_image = str(tmp_path / "0010_0000.nrrd")
+    out_label = str(tmp_path / "0010.nrrd")
+    expected_sidecar = tmp_path / "0010.json"
+
+    # Two CSV rows = two lesions
+    row1 = _make_csv_row(10, lesion_box)
+    row2 = _make_csv_row(10, BBox(1, 1, 1, 2, 2, 2))
+
+    with pytest.raises(NndetDatasetError, match="multi-lesion"):
+        convert_case(vol_path, mask_path, [row1, row2], out_image, out_label)
+
+    # The sidecar must NOT exist — the guard fired before _write_per_case_json
+    assert not expected_sidecar.exists(), (
+        f"Per-case JSON sidecar {expected_sidecar} must NOT be written when "
+        "convert_case raises for a multi-lesion case. "
+        "The guard must fire BEFORE _write_per_case_json to avoid leaving a "
+        "wrong-encoding sidecar on disk."
+    )
+
+
+# ===========================================================================
+# Test 23 — verify_nndet_dataset raises NndetDatasetError if a sidecar is missing
+#           (S2 fix check)
+#
+# TDD evidence: WRITTEN AFTER fix was applied (S2 adds the sidecar presence check).
+# An interrupted export that leaves .nrrd without .json must be caught here,
+# before nndet_prep on the server.
+# ===========================================================================
+
+
+def test_verify_nndet_dataset_detects_missing_sidecar(tmp_path: Path) -> None:
+    """verify_nndet_dataset raises NndetDatasetError if a labelsTr .nrrd lacks a sibling .json.
+
+    An interrupted or partial export_dataset run can leave label NRRDs without
+    their per-case JSON sidecars. These cases would pass spacing and splits checks
+    but fail at nndet_prep time on the server (nnDetection v0.1 load.py crashes).
+    The sidecar presence check catches this offline before the runbook is executed.
+    """
+    # Build a minimal valid dataset so splits + spacing checks pass
+    tdsc_root = tmp_path / "tdsc"
+    _build_synthetic_tdsc_root(
+        tdsc_root,
+        train_shards={"DATA00_49": [0, 1]},
+        val_ids=[100],
+        test_ids=[200],
+    )
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=2,
+        n_val_cases=1,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+    result = export_dataset(str(tdsc_root), str(out_root), spec)
+    task_dir = Path(result["task_dir"])
+
+    # Confirm export succeeded and sidecars exist
+    labels_tr = task_dir / "raw_splitted" / "labelsTr"
+    sidecars = sorted(labels_tr.glob("*.json"))
+    assert len(sidecars) == 2, f"Export should have produced 2 sidecars, got {len(sidecars)}"
+
+    # Simulate a missing sidecar (e.g. interrupted export)
+    sidecars[0].unlink()
+
+    # verify_nndet_dataset must detect the missing sidecar
+    with pytest.raises(NndetDatasetError, match="Missing per-case JSON sidecar"):
+        verify_nndet_dataset(str(task_dir))

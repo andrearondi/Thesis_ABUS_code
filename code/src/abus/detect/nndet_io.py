@@ -3,8 +3,8 @@
 Implements the three responsibilities that nnDetection cannot do for itself:
 
 1. Dataset conversion — TDSC-ABUS-2023 (NRRD volumes + NRRD masks + CSV bbox
-   labels) into nnDetection's Task directory layout (imagesTr/, labelsTr/,
-   dataset.json, splits file).
+   labels) into nnDetection's Task directory layout (raw_splitted/imagesTr/,
+   raw_splitted/labelsTr/, dataset.json, splits file).
 
 2. Physical spacing injection — every NRRD volume written into the nnDetection
    dataset carries CANONICAL_SPACING_MM in its ``space directions`` header.
@@ -28,12 +28,50 @@ Running ``python -m abus.detect.nndet_io --dry-run --case-dir <dir>`` converts
 one case from <dir> to a temporary output directory and prints a summary.  This
 is the local-data-sanity path (ASC-01_01.5).
 
-nnDetection task layout produced:
+nnDetection v0.1 task layout produced
+--------------------------------------
+nnDetection v0.1 (commit 97a58f3) expects the following layout, verified
+against nndet/utils/check.py (_check_key_missing) and nndet/io/load.py:
+
     <out_root>/Task<NNN>_<name>/
-        imagesTr/<case_id>_0000.nrrd     # volume with CANONICAL_SPACING_MM
-        labelsTr/<case_id>.nrrd          # binary mask label (uint8, {0,1})
-        dataset.json
-        splits_final.json                # nnDetection CV splits derived from frozen manifest
+        dataset.json                         # task root — nnDetection v0.1 schema
+        raw_splitted/
+            imagesTr/<case_id>_0000.nrrd     # volume with CANONICAL_SPACING_MM
+            labelsTr/<case_id>.nrrd          # binary mask label (uint8, {0,1})
+            labelsTr/<case_id>.json          # per-case instance→class JSON
+            imagesTs/<case_id>_0000.nrrd     # val/test images (inference only)
+        splits_final.json                    # nnDetection CV splits (see below)
+
+dataset.json schema (nnDetection v0.1, NOT nnUNet)
+---------------------------------------------------
+Required keys verified against nndet/utils/check.py:
+    task      (str)  — task name, e.g. "Task001_TDSCABUS"
+    dim       (int)  — 3 for 3D volumes
+    modalities (dict) — {"0": "US"}  (plural key; nnUNet uses "modality")
+    labels    (dict) — {"0": "tumor"} (foreground-only, zero-indexed; background
+                        is implicit in nnDetection — do NOT include it)
+    _project  (dict) — provenance, project-specific (tolerated as extra key)
+
+nnUNet-only keys explicitly dropped: name, numTraining, numTest,
+tensorImageSize, training, test.
+
+Per-case JSON sidecar (nnDetection v0.1 load.py requirement)
+-------------------------------------------------------------
+For every training case (labelsTr/<case>.nrrd), a sibling JSON is written:
+    labelsTr/<case>.json  →  {"instances": {"1": 0}}
+where key "1" is the binary mask value (lesion voxels = 1) and value 0 is the
+class index (labels["0"] = "tumor" — zero-indexed foreground).
+Source: nnDetection v0.1 nndet/io/load.py, load_case_cropped().
+
+splits_final.json location
+---------------------------
+nnDetection v0.1 reads splits_final.json from the PREPROCESSED directory
+(created by nndet_prep), not from raw_splitted/. Since the preprocessed
+directory does not exist before nndet_prep runs, we write splits_final.json
+to the task root alongside dataset.json. The runbook (STORY_01_01_runbook.md)
+instructs copying it to the preprocessed directory after nndet_prep creates
+it. This is option (b) of the STORY_01_01 defect 4 decision, recorded in
+docs/decisions_log.md (2026-05-20).
 """
 
 from __future__ import annotations
@@ -210,6 +248,36 @@ def _write_label_nrrd(
     nrrd.write(path, array, header)
 
 
+def _write_per_case_json(label_nrrd_path: str) -> None:
+    """Write the nnDetection v0.1 per-case instance→class JSON sidecar.
+
+    nnDetection v0.1 load.py (load_case_cropped) reads:
+        seg_props_file = f"{str(seg_file).split('.')[0]}.json"
+        properties_json["instances"] = {str(k): int(v) ...}
+
+    For TDSC-ABUS-2023 (single-lesion, single foreground class):
+        {"instances": {"1": 0}}
+    where:
+        key "1"  — binary mask value (lesion voxels = 1)
+        value 0  — class index (labels[\"0\"] = \"tumor\", zero-indexed foreground)
+
+    The BL1 escalation trigger in export_dataset aborts conversion for any
+    multi-lesion case, so single-instance encoding is consistent with the
+    in-scope assumption (confirmed from TDSC documentation and Train-split
+    inspection during the 2026-05-18 review loop).
+
+    Parameters
+    ----------
+    label_nrrd_path:
+        Path to the labelsTr/<case>.nrrd file. The sidecar is written as
+        the same path with .json replacing .nrrd.
+    """
+    json_path = Path(label_nrrd_path).with_suffix(".json")
+    with open(str(json_path), "w", encoding="utf-8") as f:
+        json.dump({"instances": {"1": 0}}, f)
+        f.write("\n")
+
+
 def _parse_id(path: str) -> int:
     """Parse numeric id from DATA_<NNN>.nrrd or MASK_<NNN>.nrrd filename."""
     stem = Path(path).stem  # e.g. "DATA_0042" or "DATA_42"
@@ -241,7 +309,9 @@ def convert_case(
     2. Load the mask via load_mask (same guard).
     3. Assert the pair is consistent via assert_paired.
     4. Write the volume with CANONICAL_SPACING_MM in the nnDetection image file.
-    5. Write the binary mask as the nnDetection label file.
+    5. Write the binary mask as the nnDetection label file, then write the
+       per-case instance JSON sidecar required by nnDetection v0.1 load.py
+       (``{"instances": {"1": 0}}``, single-lesion encoding only).
     6. Compute the lesion count from the CSV row (1 row = 1 lesion in the
        single-lesion convention used by TDSC-ABUS-2023; multi-lesion cases have
        multiple CSV rows with the same id, and the caller is responsible for
@@ -290,11 +360,13 @@ def convert_case(
     # Write image with CANONICAL_SPACING_MM injected into the NRRD header
     _write_image_nrrd(out_image_path, vol_rec.array, CANONICAL_SPACING_MM)
 
-    # Write label (binary mask, same spacing)
+    # Write label NRRD (binary mask, same spacing)
     _write_label_nrrd(out_label_path, mask_rec.array, CANONICAL_SPACING_MM)
 
     # Validate the CSV row and count lesions.
     # A dict has n_lesions=1; a list of dicts has n_lesions=len(list).
+    # The sidecar is written AFTER this block so a multi-lesion ValueError
+    # fires before writing a semantically-wrong {"instances": {"1": 0}}.
     _required_keys = {"c_x", "c_y", "c_z", "len_x", "len_y", "len_z"}
 
     def _validate_csv_row(row: dict) -> None:
@@ -324,6 +396,23 @@ def convert_case(
         _validate_csv_row(bbox_csv_row)
         n_lesions = 1
 
+    # Guard: {"instances": {"1": 0}} is only valid for a single-lesion binary mask.
+    # A multi-lesion case requires instance-index encoding (mask values 1, 2, 3, …),
+    # which is not implemented. Raise before writing the sidecar so an interrupted
+    # run never leaves a wrong-encoding JSON on disk.
+    if n_lesions > 1:
+        raise NndetDatasetError(
+            f"Case {vol_rec.case_id}: multi-lesion encoding is not supported. "
+            'Binary mask with {"instances": {"1": 0}} is only valid for '
+            f"single-lesion cases (n_lesions={n_lesions}). "
+            "Multi-lesion instance encoding (mask values 1, 2, 3, …) is out of scope "
+            "for STORY_01_01 (see BL1 escalation trigger in the runbook)."
+        )
+
+    # Write nnDetection v0.1 per-case instance JSON sidecar (must come after the
+    # lesion-count guard above to avoid writing a semantically-wrong sidecar).
+    _write_per_case_json(out_label_path)
+
     return {
         "case_id": vol_rec.case_id,
         "out_image_path": str(out_image_path),
@@ -339,12 +428,23 @@ def convert_case(
 
 
 def build_dataset_json(spec: NndetDatasetSpec, out_path: str) -> None:
-    """Write nnDetection's dataset.json from the pinned NndetDatasetSpec.
+    """Write nnDetection v0.1 dataset.json from the pinned NndetDatasetSpec.
 
-    The JSON follows nnDetection's expected schema: name, tensorImageSize,
-    modality, labels, numTraining, numTest, training (empty list placeholder),
-    test (empty list placeholder).  The training/test lists are populated with
-    actual file paths by the build script after conversion.
+    Produces the nnDetection v0.1 schema verified against nndet/utils/check.py
+    (commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5).
+
+    Required keys (nnDetection v0.1):
+        task      (str)  — task name
+        dim       (int)  — 3 for 3D volumes
+        modalities (dict) — {"0": modality_string} (plural; NOT "modality")
+        labels    (dict) — foreground-only, zero-indexed: {"0": "tumor"}
+                           Background is implicit; do NOT include it.
+
+    Dropped (nnUNet-only, absent from nnDetection v0.1):
+        name, numTraining, numTest, tensorImageSize, training, test.
+
+    Kept:
+        _project — project-specific provenance dict (tolerated as extra key).
 
     Parameters
     ----------
@@ -354,18 +454,18 @@ def build_dataset_json(spec: NndetDatasetSpec, out_path: str) -> None:
         Destination JSON path.
     """
     data: dict[str, Any] = {
-        "name": spec.task_name,
-        "tensorImageSize": "3D",
-        "modality": {"0": spec.modality},
-        "labels": {"0": "background", "1": "tumor"},
-        "numTraining": spec.n_train_cases,
-        "numTest": spec.n_test_cases,
-        "training": [],
-        "test": [],
-        # Project-specific metadata for provenance
+        # nnDetection v0.1 required keys (verified against nndet/utils/check.py)
+        "task": spec.task_name,
+        "dim": 3,
+        "modalities": {"0": spec.modality},
+        # Foreground-only, zero-indexed labels (background implicit in nnDetection)
+        "labels": {"0": "tumor"},
+        # Project-specific provenance — tolerated as extra key by nnDetection
         "_project": {
             "task_id": spec.task_id,
+            "n_train_cases": spec.n_train_cases,
             "n_val_cases": spec.n_val_cases,
+            "n_test_cases": spec.n_test_cases,
             "spacing_mm": list(spec.spacing_mm),
             "label_semantics": spec.label_semantics,
             "story_id": "01_01",
@@ -489,17 +589,26 @@ def export_dataset(
     tdsc_path = Path(tdsc_root)
     task_dir = Path(out_root) / spec.task_name
 
-    # nnDetection layout convention:
-    #   imagesTr/ + labelsTr/ — training cases only (100 from Train split).
-    #     These cases participate in the 5-fold cross-validation.
-    #   imagesTs/ — held-out cases (val + test). No labels written.
-    #     nnDetection scores these cases using the trained model via batch inference;
-    #     the project's 5-fold splits file only covers the 100 training cases, so
-    #     nnDetection prep must not see val/test cases in imagesTr or it will
-    #     encounter unknown case IDs when reading splits_final.json.
-    images_tr = task_dir / "imagesTr"
-    labels_tr = task_dir / "labelsTr"
-    images_ts = task_dir / "imagesTs"
+    # nnDetection v0.1 layout convention (verified against nndet/utils/check.py
+    # and nndet_prep at commit 97a58f3):
+    #
+    #   Task<NNN>_<name>/
+    #     dataset.json                       ← task root (NOT under raw_splitted)
+    #     splits_final.json                  ← written here; runbook copies to
+    #                                          preprocessed/ after nndet_prep runs
+    #     raw_splitted/
+    #       imagesTr/<case>_0000.nrrd        ← training images only (100 cases)
+    #       labelsTr/<case>.nrrd             ← binary mask labels
+    #       labelsTr/<case>.json             ← per-case instance→class sidecar
+    #       imagesTs/<case>_0000.nrrd        ← val/test images (inference only)
+    #
+    # imagesTr + labelsTr hold training cases only (IDs in frozen 5-fold manifest).
+    # imagesTs holds val+test; no labels written (batch inference targets).
+    # nnDetection prep encounters only training case IDs in splits_final.json.
+    raw_splitted = task_dir / "raw_splitted"
+    images_tr = raw_splitted / "imagesTr"
+    labels_tr = raw_splitted / "labelsTr"
+    images_ts = raw_splitted / "imagesTs"
     images_tr.mkdir(parents=True, exist_ok=True)
     labels_tr.mkdir(parents=True, exist_ok=True)
     images_ts.mkdir(parents=True, exist_ok=True)
@@ -683,14 +792,25 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
     """
     task_dir = Path(nndet_dataset_root)
 
-    # --- Check dataset.json exists ---
+    # --- Check dataset.json exists and has nnDetection v0.1 required keys ---
     ds_json_path = task_dir / "dataset.json"
     if not ds_json_path.exists():
         raise NndetDatasetError(f"dataset.json not found in {task_dir}")
     with open(ds_json_path, encoding="utf-8") as f:
-        _ = json.load(f)  # Validate it's valid JSON
+        ds_cfg = json.load(f)
+    # Validate nnDetection v0.1 required keys (mirrors nndet/utils/check.py)
+    for required_key in ("task", "dim", "modalities", "labels"):
+        if required_key not in ds_cfg:
+            raise NndetDatasetError(
+                f"dataset.json is missing required nnDetection v0.1 key '{required_key}'. "
+                f"Found keys: {sorted(ds_cfg.keys())}. "
+                "Run build_dataset_json again — the old nnUNet schema is no longer valid."
+            )
 
     # --- Check splits_final.json faithfulness (ASC-01_01.3) ---
+    # splits_final.json lives at the task root (written by write_nndet_splits);
+    # after nndet_prep it must also be copied to the preprocessed/ directory
+    # (runbook step — see docs/decisions_log.md 2026-05-20 defect-4 decision).
     splits_path = task_dir / "splits_final.json"
     if not splits_path.exists():
         raise NndetDatasetError(
@@ -733,8 +853,24 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
                 f"splits_final.json has {len(produced_val)}."
             )
 
-    # --- Check spacing in imagesTr/ ---
-    images_tr = task_dir / "imagesTr"
+    # --- Check per-case JSON sidecar presence in raw_splitted/labelsTr/ ---
+    # nnDetection v0.1 load.py reads a sibling .json for every label NRRD.
+    # An interrupted or partial export can leave .nrrd files without sidecars;
+    # those cases pass spacing and splits checks here but fail at nndet_prep time.
+    labels_tr = task_dir / "raw_splitted" / "labelsTr"
+    if labels_tr.exists():
+        for nrrd_file in sorted(labels_tr.glob("*.nrrd")):
+            json_sidecar = nrrd_file.with_suffix(".json")
+            if not json_sidecar.exists():
+                raise NndetDatasetError(
+                    f"Missing per-case JSON sidecar: {json_sidecar}. "
+                    "nnDetection v0.1 load.py requires a sibling .json for every "
+                    "label NRRD. Re-run export_dataset to regenerate sidecars."
+                )
+
+    # --- Check spacing in raw_splitted/imagesTr/ ---
+    # nnDetection v0.1 layout: images live under raw_splitted/imagesTr/
+    images_tr = task_dir / "raw_splitted" / "imagesTr"
     n_images_checked = 0
     spacing_atol = 1e-6
 
@@ -762,7 +898,8 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
             n_images_checked += 1
 
     log.info(
-        "verify_nndet_dataset: spacing OK (%d images), splits OK (%d folds), dataset.json OK",
+        "verify_nndet_dataset: spacing OK (%d images), splits OK (%d folds), "
+        "dataset.json OK, sidecars OK",
         n_images_checked,
         len(produced_splits),
     )
@@ -771,6 +908,7 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
         "spacing_ok": True,
         "splits_ok": True,
         "dataset_json_ok": True,
+        "sidecars_ok": True,
         "n_images_checked": n_images_checked,
         "n_splits_checked": len(produced_splits),
     }

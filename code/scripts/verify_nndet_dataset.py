@@ -114,7 +114,8 @@ def main() -> None:
             sys.exit(1)
 
         # Load the nnDetection image to get the actual target grid spacing
-        img_path = task_dir / "imagesTr" / f"{case_id:04d}_0000.nrrd"
+        # nnDetection v0.1 layout: images under raw_splitted/imagesTr/
+        img_path = task_dir / "raw_splitted" / "imagesTr" / f"{case_id:04d}_0000.nrrd"
         if not img_path.exists():
             # Try imagesTr for the resampled preprocessed file if nndet_prep has run
             log.warning(
