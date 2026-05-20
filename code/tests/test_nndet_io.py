@@ -62,6 +62,7 @@ from abus.detect.nndet_io import (
     NndetDatasetSpec,
     build_dataset_json,
     convert_case,
+    export_dataset,
     verify_nndet_dataset,
     write_nndet_splits,
 )
@@ -623,3 +624,244 @@ def test_convert_case_invalid_csv_row_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="missing required keys"):
         convert_case(vol_path, mask_path, incomplete_row, out_image, out_label)
+
+
+# ===========================================================================
+# Helper for end-to-end export_dataset tests (Test 14, 15, 16 below)
+# ===========================================================================
+
+
+def _build_synthetic_tdsc_root(
+    root: Path,
+    train_shards: dict[str, list[int]],  # subfolder name -> case ids (DATA only)
+    val_ids: list[int],
+    test_ids: list[int],
+    mask_padding: int = 3,  # zero-pad width for MASK_*.nrrd filenames in Train
+) -> None:
+    """Materialise a minimal TDSC-like directory tree under ``root``.
+
+    The Train split uses the nested-shard layout discovered on the official
+    distribution (Train/DATA/<shard>/DATA_<NNN>.nrrd) with a flat MASK folder;
+    Validation and Test use the documented flat layout. A bbx_labels.csv with
+    one lesion per case is written under each split. Volumes and masks share
+    a small synthetic lesion so convert_case succeeds end-to-end.
+
+    Parameters
+    ----------
+    train_shards:
+        Mapping from shard subfolder name (e.g. ``"DATA00_49"``) to the list
+        of case IDs whose DATA files live in that shard. The MASK_*.nrrd files
+        for these IDs always live flat in ``Train/MASK/``.
+    mask_padding:
+        Zero-padding width for Train MASK filenames. The on-disk Train MASK
+        files are 3-digit-padded (``MASK_000.nrrd``); val/test masks use
+        no padding for IDs ≥ 100 (``MASK_100.nrrd``). Default 3 mirrors Train.
+    """
+    lesion_box = BBox(2, 3, 4, 4, 6, 7)
+    csv_header = ["id", "c_x", "c_y", "c_z", "len_x", "len_y", "len_z"]
+
+    def _write_pair(data_dir: Path, mask_dir: Path, cid: int, pad: int) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        data_name = f"DATA_{cid:0{pad}d}.nrrd"
+        mask_name = f"MASK_{cid:0{pad}d}.nrrd"
+        _write_identity_volume_nrrd(str(data_dir / data_name))
+        _write_identity_mask_nrrd(str(mask_dir / mask_name), lesion_box=lesion_box)
+
+    def _write_csv(csv_path: Path, ids: list[int]) -> None:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_header)
+            writer.writeheader()
+            for cid in ids:
+                writer.writerow(_make_csv_row(cid, lesion_box))
+
+    # --- Train: nested DATA shards + flat MASK ---
+    train_dir = root / "Train"
+    train_mask_dir = train_dir / "MASK"
+    all_train_ids: list[int] = []
+    for shard_name, ids in train_shards.items():
+        shard_data_dir = train_dir / "DATA" / shard_name
+        for cid in ids:
+            _write_pair(shard_data_dir, train_mask_dir, cid, mask_padding)
+            all_train_ids.append(cid)
+    _write_csv(train_dir / "bbx_labels.csv", all_train_ids)
+
+    # --- Validation: flat DATA + flat MASK (use no-pad — IDs are 3 digits anyway) ---
+    val_dir = root / "Validation"
+    for cid in val_ids:
+        _write_pair(val_dir / "DATA", val_dir / "MASK", cid, pad=1)
+    _write_csv(val_dir / "bbx_labels.csv", val_ids)
+
+    # --- Test: flat DATA + flat MASK ---
+    test_dir = root / "Test"
+    for cid in test_ids:
+        _write_pair(test_dir / "DATA", test_dir / "MASK", cid, pad=1)
+    _write_csv(test_dir / "bbx_labels.csv", test_ids)
+
+
+# ===========================================================================
+# Test 14 — export_dataset handles nested Train/DATA shards (2026-05-20 fix)
+# ===========================================================================
+
+
+def test_export_dataset_handles_nested_train_shards(tmp_path: Path) -> None:
+    """export_dataset discovers Train cases laid out in nested DATA shards.
+
+    The official TDSC distribution ships ``Train/DATA/DATA00_49/`` and
+    ``Train/DATA/DATA50_99/`` (two shards), while Validation and Test are
+    flat. Prior to the 2026-05-20 fix, ``data_dir.glob("DATA_*.nrrd")`` (non-
+    recursive) silently returned 0 matches under ``Train/DATA/``, so the
+    builder produced a dataset with 0 training cases without raising any
+    error. The fix uses ``rglob`` and a case-id keyed dict; this test pins
+    that behaviour. Regression-guards against the runbook STORY_01_01
+    Checkpoint-4 failure of 2026-05-20.
+    """
+    tdsc_root = tmp_path / "tdsc"
+    _build_synthetic_tdsc_root(
+        tdsc_root,
+        train_shards={
+            "DATA00_49": [0, 1, 2],  # 3-digit-padded: DATA_000.nrrd, DATA_001.nrrd, DATA_002.nrrd
+            "DATA50_99": [50, 99],  # DATA_050.nrrd, DATA_099.nrrd
+        },
+        val_ids=[100, 101],
+        test_ids=[200],
+    )
+
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=5,  # 3 + 2 across the two shards
+        n_val_cases=2,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+
+    result = export_dataset(str(tdsc_root), str(out_root), spec)
+
+    assert result["n_train"] == 5, (
+        f"Expected n_train=5 across two nested shards, got {result['n_train']}. "
+        "Recursive glob over Train/DATA/**/DATA_*.nrrd appears broken."
+    )
+    assert result["n_val"] == 2
+    assert result["n_test"] == 1
+
+    # Every training case must have produced both an image and a label
+    task_dir = Path(result["task_dir"])
+    images_tr = sorted(task_dir.glob("imagesTr/*.nrrd"))
+    labels_tr = sorted(task_dir.glob("labelsTr/*.nrrd"))
+    assert len(images_tr) == 5, f"Expected 5 imagesTr files, got {len(images_tr)}"
+    assert len(labels_tr) == 5, f"Expected 5 labelsTr files, got {len(labels_tr)}"
+
+    # Val + test images live under imagesTs (no labels)
+    images_ts = sorted(task_dir.glob("imagesTs/*.nrrd"))
+    assert len(images_ts) == 3, f"Expected 3 imagesTs files (val+test), got {len(images_ts)}"
+
+
+# ===========================================================================
+# Test 15 — export_dataset refuses to write a partial dataset (silent-zero guard)
+# ===========================================================================
+
+
+def test_export_dataset_raises_on_train_count_mismatch(tmp_path: Path) -> None:
+    """export_dataset raises NndetDatasetError when discovered train count != spec.
+
+    The 2026-05-20 Checkpoint-4 failure produced a dataset with n_train=0
+    while spec.n_train_cases=100 because the non-recursive glob silently
+    returned an empty iterator. This test pins the discovery-phase count
+    assertion that makes such a partial conversion impossible.
+    """
+    tdsc_root = tmp_path / "tdsc"
+    _build_synthetic_tdsc_root(
+        tdsc_root,
+        train_shards={"DATA00_49": [0, 1]},  # only 2 train cases on disk
+        val_ids=[100],
+        test_ids=[200],
+    )
+
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=5,  # spec lies — disk has only 2
+        n_val_cases=1,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+
+    with pytest.raises(NndetDatasetError, match="Train"):
+        export_dataset(str(tdsc_root), str(out_root), spec)
+
+
+# ===========================================================================
+# Test 16 — case-id matching across DATA and MASK tolerates padding-width skew
+# ===========================================================================
+
+
+def test_export_dataset_tolerates_mask_padding_skew(tmp_path: Path) -> None:
+    """Mixed zero-padding widths across DATA and MASK files are tolerated.
+
+    Real-world TDSC Train ships ``DATA_000.nrrd`` and ``MASK_000.nrrd``
+    (3-digit padded). The previous mask-lookup heuristic tried
+    ``MASK_{cid:04d}.nrrd`` then ``MASK_{cid}.nrrd`` — neither matches a
+    3-digit-padded filename for low case IDs, so the fallback silently
+    failed in production. The new implementation keys by parsed integer
+    case_id, which is padding-agnostic. This test asserts that DATA files
+    3-digit-padded with MASK files 4-digit-padded still pair correctly.
+    """
+    tdsc_root = tmp_path / "tdsc"
+    # Create a Train split with 3-digit DATA filenames AND 4-digit MASK
+    # filenames (artificial mix to exercise the padding-agnostic match)
+    train_dir = tdsc_root / "Train"
+    train_data_dir = train_dir / "DATA" / "DATA00_49"
+    train_mask_dir = train_dir / "MASK"
+    train_data_dir.mkdir(parents=True)
+    train_mask_dir.mkdir(parents=True)
+    lesion_box = BBox(2, 3, 4, 4, 6, 7)
+    case_ids = [0, 7, 42]
+    for cid in case_ids:
+        _write_identity_volume_nrrd(str(train_data_dir / f"DATA_{cid:03d}.nrrd"))
+        _write_identity_mask_nrrd(
+            str(train_mask_dir / f"MASK_{cid:04d}.nrrd"),  # 4-digit-padded
+            lesion_box=lesion_box,
+        )
+    csv_header = ["id", "c_x", "c_y", "c_z", "len_x", "len_y", "len_z"]
+    with open(train_dir / "bbx_labels.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_header)
+        writer.writeheader()
+        for cid in case_ids:
+            writer.writerow(_make_csv_row(cid, lesion_box))
+
+    # Trivial Val + Test (one case each, flat layout)
+    for split_name, cid in (("Validation", 100), ("Test", 200)):
+        split_dir = tdsc_root / split_name
+        (split_dir / "DATA").mkdir(parents=True)
+        (split_dir / "MASK").mkdir(parents=True)
+        _write_identity_volume_nrrd(str(split_dir / "DATA" / f"DATA_{cid}.nrrd"))
+        _write_identity_mask_nrrd(
+            str(split_dir / "MASK" / f"MASK_{cid}.nrrd"),
+            lesion_box=lesion_box,
+        )
+        with open(split_dir / "bbx_labels.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_header)
+            writer.writeheader()
+            writer.writerow(_make_csv_row(cid, lesion_box))
+
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=3,
+        n_val_cases=1,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+
+    result = export_dataset(str(tdsc_root), str(out_root), spec)
+    assert result["n_train"] == 3

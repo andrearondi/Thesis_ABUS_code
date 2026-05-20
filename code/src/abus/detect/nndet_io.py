@@ -441,11 +441,15 @@ def export_dataset(
     Parameters
     ----------
     tdsc_root:
-        Root of the TDSC-ABUS-2023 dataset. Expected layout::
+        Root of the TDSC-ABUS-2023 dataset. Two on-disk layouts are supported
+        per split (the official distribution ships Train with nested DATA
+        shards but a flat MASK directory; Validation/Test are flat both sides)::
 
             <tdsc_root>/
                 Train/
-                    DATA/DATA_<NNN>.nrrd
+                    DATA/DATA_<NNN>.nrrd                      # flat (any split)
+                    DATA/DATA00_49/DATA_<NNN>.nrrd            # nested shard (Train)
+                    DATA/DATA50_99/DATA_<NNN>.nrrd            # nested shard (Train)
                     MASK/MASK_<NNN>.nrrd
                     bbx_labels.csv
                 Validation/
@@ -456,6 +460,11 @@ def export_dataset(
                     DATA/DATA_<NNN>.nrrd
                     MASK/MASK_<NNN>.nrrd
                     bbx_labels.csv
+
+        Discovery uses ``rglob`` so flat and nested-shard layouts both work;
+        case-id matching across DATA and MASK is done by parsed integer, so
+        any zero-padding width (``DATA_0.nrrd``, ``DATA_000.nrrd``,
+        ``DATA_0000.nrrd``) is tolerated.
 
     out_root:
         Parent of the nnDetection Task directory.
@@ -500,35 +509,89 @@ def export_dataset(
 
     # Training cases go to imagesTr/labelsTr (nnDetection cross-validation).
     # Val/test cases go to imagesTs/ only — no labels, used for inference only.
-    _train_split = ("Train", "n_train", images_tr, labels_tr, True)
-    _val_split = ("Validation", "n_val", images_ts, None, False)
-    _test_split = ("Test", "n_test", images_ts, None, False)
+    # Each tuple includes the spec-pinned expected case count so the discovery
+    # phase can refuse to proceed if the on-disk file count does not match
+    # (silent-zero protection; see 2026-05-20 patch in decisions_log).
+    _train_split = ("Train", "n_train", images_tr, labels_tr, True, spec.n_train_cases)
+    _val_split = ("Validation", "n_val", images_ts, None, False, spec.n_val_cases)
+    _test_split = ("Test", "n_test", images_ts, None, False, spec.n_test_cases)
 
-    for split_name, count_key, img_dir, lbl_dir, write_label in (
+    for split_name, count_key, img_dir, lbl_dir, write_label, expected_count in (
         _train_split,
         _val_split,
         _test_split,
     ):
         split_dir = tdsc_path / split_name
-        data_dir = split_dir / "DATA"
-        mask_dir = split_dir / "MASK"
+        data_root = split_dir / "DATA"
+        mask_root = split_dir / "MASK"
         csv_path = split_dir / "bbx_labels.csv"
 
         if not csv_path.exists():
             raise FileNotFoundError(f"bbx_labels.csv not found: {csv_path}")
+        if not data_root.exists():
+            raise FileNotFoundError(
+                f"DATA directory not found for split '{split_name}': {data_root}"
+            )
+        if not mask_root.exists():
+            raise FileNotFoundError(
+                f"MASK directory not found for split '{split_name}': {mask_root}"
+            )
+
+        # Recursive glob — TDSC Train ships nested DATA00_49/DATA50_99 shards
+        # under DATA/, while Validation/Test are flat. rglob handles both.
+        # MASK ships flat in every split observed so far, but rglob is safe
+        # there too. (Layout scope gap discovered 2026-05-20; see runbook.)
+        data_files = sorted(data_root.rglob("DATA_*.nrrd"))
+        mask_files = sorted(mask_root.rglob("MASK_*.nrrd"))
+
+        # Key by parsed integer case_id so any zero-padding width is tolerated
+        # (DATA_0.nrrd, DATA_000.nrrd, DATA_0000.nrrd all map to the same key).
+        data_by_id: dict[int, Path] = {}
+        for p in data_files:
+            cid = _parse_id(str(p))
+            if cid in data_by_id:
+                raise NndetDatasetError(
+                    f"Split '{split_name}': duplicate DATA file for case_id={cid}: "
+                    f"{data_by_id[cid]} and {p}."
+                )
+            data_by_id[cid] = p
+
+        mask_by_id: dict[int, Path] = {}
+        for p in mask_files:
+            cid = _parse_id(str(p))
+            if cid in mask_by_id:
+                raise NndetDatasetError(
+                    f"Split '{split_name}': duplicate MASK file for case_id={cid}: "
+                    f"{mask_by_id[cid]} and {p}."
+                )
+            mask_by_id[cid] = p
+
+        # Discovery-phase count check. Refuses to write a partial dataset if
+        # the on-disk file count diverges from the spec — this is the silent-
+        # zero guard. Without it, an unmatched glob silently yields 0 cases.
+        if len(data_by_id) != expected_count:
+            raise NndetDatasetError(
+                f"Split '{split_name}': discovered {len(data_by_id)} DATA file(s) "
+                f"under {data_root}, but spec.{count_key}_cases requires "
+                f"{expected_count}. On-disk layout may have changed; check the "
+                "DATA directory and any nested subdirectories."
+            )
+
+        # Every DATA case must have a matching MASK in TDSC.
+        missing_masks = sorted(set(data_by_id) - set(mask_by_id))
+        if missing_masks:
+            raise FileNotFoundError(
+                f"Split '{split_name}': MASK file missing for case_id(s) "
+                f"{missing_masks}. DATA files exist under {data_root} but the "
+                f"corresponding masks are absent from {mask_root}."
+            )
 
         bbox_df = pd.read_csv(csv_path)
         # Group by case id (column 'id' in CSV)
         grouped = bbox_df.groupby("id")
 
-        for vol_nrrd in sorted(data_dir.glob("DATA_*.nrrd")):
-            case_id = _parse_id(str(vol_nrrd))
-            mask_nrrd = mask_dir / f"MASK_{case_id:04d}.nrrd"
-            if not mask_nrrd.exists():
-                # Try without zero-padding (TDSC uses no zero-padding in val/test)
-                mask_nrrd = mask_dir / f"MASK_{case_id}.nrrd"
-            if not mask_nrrd.exists():
-                raise FileNotFoundError(f"Mask not found for case {case_id}: {mask_dir}")
+        for case_id, vol_nrrd in sorted(data_by_id.items()):
+            mask_nrrd = mask_by_id[case_id]
 
             out_image = str(img_dir / _canonical_image_name(case_id))
             out_label = str(lbl_dir / _canonical_label_name(case_id)) if lbl_dir else None
