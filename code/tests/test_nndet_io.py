@@ -443,11 +443,13 @@ def test_verify_detects_split_mismatch(tmp_path: Path) -> None:
 
     # Write a minimal dataset.json using the correct nnDetection v0.1 schema
     # so verify_nndet_dataset proceeds to the splits check (not blocked by schema check).
+    # test_labels is required since Round 3 (preprocess.py line 394 contract).
     ds_json = {
         "task": "Task001_TDSCABUS",
         "dim": 3,
         "modalities": {"0": "US"},
         "labels": {"0": "tumor"},
+        "test_labels": False,
     }
     with open(task_dir / "dataset.json", "w", encoding="utf-8") as f:
         json.dump(ds_json, f)
@@ -1351,3 +1353,103 @@ def test_verify_nndet_dataset_detects_missing_sidecar(tmp_path: Path) -> None:
     # verify_nndet_dataset must detect the missing sidecar
     with pytest.raises(NndetDatasetError, match="Missing per-case JSON sidecar"):
         verify_nndet_dataset(str(task_dir))
+
+
+# ===========================================================================
+# Test 24 — dataset.json contains all keys read by preprocess.py pipeline
+#           (Round 3 fix: preprocess.py read contract — full coverage)
+#
+# TDD evidence: WRITTEN BEFORE fix is applied.
+# The test FAILS on the current build_dataset_json because test_labels is absent.
+# This is the regression gap that allowed the Round-2 server failure:
+#   omegaconf.errors.ConfigKeyError: Missing key test_labels (preprocess.py line 394)
+#
+# The mini-replica in test_dataset_json_passes_nndet_check_replica (Test 20) only
+# covers check_dataset_file's contract (task, dim, modalities, labels). preprocess.py
+# reads additional keys DOWNSTREAM of check_dataset_file with no defaults.
+#
+# OmegaConf composition note (confirmed from server traceback preprocess.py 287–401):
+#   nndet's OmegaConf composes cfg from dataset.json by nesting all non-'task'
+#   keys under "data": cfg["task"] -> file["task"]; cfg["data"]["X"] -> file["X"].
+#   Accesses confirmed from the traceback + user-provided code context at commit
+#   97a58f3110b71caf1b4bcc1851e67cf11e987fc5:
+#     line 287: data_info = cfg["data"]
+#     line 289: data_info["modalities"]   (already in schema)
+#     line 374: data_info["dim"]          (already in schema)
+#     line 394: data_info["test_labels"]  (MISSING — this test catches it)
+#   Also confirmed present in the check_dataset_file contract:
+#     cfg["task"]           (already in schema)
+#     cfg["data"]["labels"] (already in schema)
+# ===========================================================================
+
+
+def test_dataset_json_has_preprocess_read_contract(tmp_path: Path) -> None:
+    """dataset.json contains ALL keys read by preprocess.py up to and including run().
+
+    This is a STRONGER contract than test_dataset_json_passes_nndet_check_replica
+    (Test 20), which only covers check_dataset_file. preprocess.py also reads
+    cfg["data"]["test_labels"] (line 394) downstream, with no default.
+
+    OmegaConf composition (confirmed from server traceback at commit 97a58f3):
+        cfg["task"]             -> dataset.json key "task"
+        cfg["data"]["X"]        -> dataset.json key "X" for all other keys
+
+    Keys confirmed accessed by preprocess.py (source: server traceback + user-provided
+    code context at commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5):
+        cfg["task"]                    line ~86 check_dataset_file
+        cfg["data"]["modalities"]      line 289
+        cfg["data"]["dim"]             line 374
+        cfg["data"]["labels"]          line ~89 check_dataset_file
+        cfg["data"]["test_labels"]     line 394  <-- the one that failed on server
+
+    Round-2 regression test only: checked keys validated by check_dataset_file.
+    This test adds test_labels to the required key set so the full preprocess.py
+    contract is covered locally.
+    """
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=100,
+        n_val_cases=30,
+        n_test_cases=70,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="single foreground class: tumor",
+    )
+    out_path = str(tmp_path / "dataset.json")
+    build_dataset_json(spec, out_path)
+
+    with open(out_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Keys confirmed accessed by check_dataset_file (already covered by Test 20)
+    for required_key in ("task", "dim", "modalities", "labels"):
+        assert required_key in data, (
+            f"dataset.json must contain '{required_key}' "
+            f"(check_dataset_file contract); found: {sorted(data.keys())}"
+        )
+
+    # Key confirmed accessed DOWNSTREAM of check_dataset_file in preprocess.py
+    # at line 394: if cfg["data"]["test_labels"]: — no default, raises ConfigKeyError.
+    # Value must be False: val/test ground truth lives in TDSC source, accessed
+    # via our own evaluation pipeline, NOT via nnDetection's labelsTs/ mechanism.
+    # Setting True would cause nndet_prep to call check_data_and_label_splitted(
+    # test=True, labels=True) and demand labelsTs/<case>.nrrd + .json, which we
+    # do not provide (thesis §3.2 held-out evaluation policy).
+    assert "test_labels" in data, (
+        "dataset.json must contain 'test_labels' key (preprocess.py line 394 reads "
+        "cfg['data']['test_labels'] with no default; missing key raises "
+        "omegaconf.errors.ConfigKeyError). This was the Round-3 server failure. "
+        f"Found keys: {sorted(data.keys())}"
+    )
+    # Type check first: a string "false" would pass the is-False check on some Python versions
+    # but is NOT a valid JSON boolean — the more informative error comes from the isinstance check.
+    assert isinstance(data["test_labels"], bool), (
+        f"test_labels must be a JSON boolean (bool), got {type(data['test_labels']).__name__}. "
+        "A string 'false' serialised into JSON would be read as a str by json.load, "
+        "not a bool, and OmegaConf does not coerce JSON strings to bool in this context."
+    )
+    assert data["test_labels"] is False, (
+        f"test_labels must be False (no labelsTs/ provided; thesis §3.2 held-out eval). "
+        f"Got: {data['test_labels']!r}"
+    )

@@ -44,13 +44,17 @@ against nndet/utils/check.py (_check_key_missing) and nndet/io/load.py:
 
 dataset.json schema (nnDetection v0.1, NOT nnUNet)
 ---------------------------------------------------
-Required keys verified against nndet/utils/check.py:
-    task      (str)  — task name, e.g. "Task001_TDSCABUS"
-    dim       (int)  — 3 for 3D volumes
+Required keys verified against nndet/utils/check.py and preprocess.py:
+    task       (str)  — task name, e.g. "Task001_TDSCABUS"
+    dim        (int)  — 3 for 3D volumes
     modalities (dict) — {"0": "US"}  (plural key; nnUNet uses "modality")
-    labels    (dict) — {"0": "tumor"} (foreground-only, zero-indexed; background
-                        is implicit in nnDetection — do NOT include it)
-    _project  (dict) — provenance, project-specific (tolerated as extra key)
+    labels     (dict) — {"0": "tumor"} (foreground-only, zero-indexed; background
+                         is implicit in nnDetection — do NOT include it)
+    test_labels (bool) — False: preprocess.py line 394 reads this key with no
+                         default. False means nndet_prep will NOT attempt to
+                         check labelsTs/ (which we do not provide — thesis §3.2
+                         held-out evaluation policy).
+    _project   (dict) — provenance, project-specific (tolerated as extra key)
 
 nnUNet-only keys explicitly dropped: name, numTraining, numTest,
 tensorImageSize, training, test.
@@ -434,11 +438,15 @@ def build_dataset_json(spec: NndetDatasetSpec, out_path: str) -> None:
     (commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5).
 
     Required keys (nnDetection v0.1):
-        task      (str)  — task name
-        dim       (int)  — 3 for 3D volumes
-        modalities (dict) — {"0": modality_string} (plural; NOT "modality")
-        labels    (dict) — foreground-only, zero-indexed: {"0": "tumor"}
-                           Background is implicit; do NOT include it.
+        task        (str)  — task name
+        dim         (int)  — 3 for 3D volumes
+        modalities  (dict) — {"0": modality_string} (plural; NOT "modality")
+        labels      (dict) — foreground-only, zero-indexed: {"0": "tumor"}
+                             Background is implicit; do NOT include it.
+        test_labels (bool) — False; preprocess.py line 394 reads this key with
+                             no OmegaConf default. False directs nndet_prep to
+                             skip the labelsTs/ check (no test labels provided —
+                             thesis §3.2 held-out evaluation policy).
 
     Dropped (nnUNet-only, absent from nnDetection v0.1):
         name, numTraining, numTest, tensorImageSize, training, test.
@@ -460,6 +468,13 @@ def build_dataset_json(spec: NndetDatasetSpec, out_path: str) -> None:
         "modalities": {"0": spec.modality},
         # Foreground-only, zero-indexed labels (background implicit in nnDetection)
         "labels": {"0": "tumor"},
+        # preprocess.py line 394 reads cfg["data"]["test_labels"] with no default.
+        # Value is False: val/test ground truth is consumed by our own evaluation
+        # pipeline (thesis §3.2 held-out policy), NOT via nnDetection's labelsTs/
+        # mechanism. Setting True would cause nndet_prep to call
+        # check_data_and_label_splitted(test=True, labels=True) and demand
+        # labelsTs/<case>.nrrd + <case>.json, which we do not provide.
+        "test_labels": False,
         # Project-specific provenance — tolerated as extra key by nnDetection
         "_project": {
             "task_id": spec.task_id,
@@ -798,13 +813,15 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
         raise NndetDatasetError(f"dataset.json not found in {task_dir}")
     with open(ds_json_path, encoding="utf-8") as f:
         ds_cfg = json.load(f)
-    # Validate nnDetection v0.1 required keys (mirrors nndet/utils/check.py)
-    for required_key in ("task", "dim", "modalities", "labels"):
+    # Validate nnDetection v0.1 required keys — both the check_dataset_file contract
+    # (task, dim, modalities, labels) and the downstream preprocess.py read contract
+    # (test_labels — confirmed from server traceback at commit 97a58f3, line 394).
+    for required_key in ("task", "dim", "modalities", "labels", "test_labels"):
         if required_key not in ds_cfg:
             raise NndetDatasetError(
-                f"dataset.json is missing required nnDetection v0.1 key '{required_key}'. "
+                f"dataset.json is missing required key '{required_key}'. "
                 f"Found keys: {sorted(ds_cfg.keys())}. "
-                "Run build_dataset_json again — the old nnUNet schema is no longer valid."
+                "Run build_dataset_json again to regenerate with the full schema."
             )
 
     # --- Check splits_final.json faithfulness (ASC-01_01.3) ---
