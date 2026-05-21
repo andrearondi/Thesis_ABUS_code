@@ -6,8 +6,8 @@ Implements the three responsibilities that nnDetection cannot do for itself:
    labels) into nnDetection's Task directory layout (raw_splitted/imagesTr/,
    raw_splitted/labelsTr/, dataset.json, splits file).
 
-2. Physical spacing injection — every NRRD volume written into the nnDetection
-   dataset carries CANONICAL_SPACING_MM in its ``space directions`` header.
+2. Physical spacing injection — every NIfTI volume written into the nnDetection
+   dataset carries CANONICAL_SPACING_MM in its NIfTI header voxel dimensions.
    Without this, nnDetection's fingerprint sees 1 mm isotropic spacing (the
    placeholder) and resamples on a wrong grid, corrupting every downstream
    coordinate (Risk 1 in STORY_01_01).
@@ -28,19 +28,34 @@ Running ``python -m abus.detect.nndet_io --dry-run --case-dir <dir>`` converts
 one case from <dir> to a temporary output directory and prints a summary.  This
 is the local-data-sanity path (ASC-01_01.5).
 
+File format (Round 4 migration: .nrrd -> .nii.gz)
+--------------------------------------------------
+nnDetection v0.1 paths.py (commit 97a58f3) path-discovery layer globs
+``*.nii.gz`` and strips that suffix when building case_id lists. The SimpleITK
+reader used by nndet/io/load.py can read NIfTI format. .nrrd files are silently
+invisible to nndet's discovery layer (the glob never matches), producing the
+"0it [00:00, ?it/s]" failure observed in the Round-4 server run.
+
+Writer: SimpleITK (already a transitive nnDetection dependency). Spacing is
+stored in the NIfTI pixdim header. Float32 precision of the NIfTI format
+introduces ~1e-9 round-trip noise on CANONICAL_SPACING_MM, well within the
+1e-6 tolerance used by verify_nndet_dataset.
+
+Decision: docs/decisions_log.md Round-4 entry (2026-05-21).
+
 nnDetection v0.1 task layout produced
 --------------------------------------
 nnDetection v0.1 (commit 97a58f3) expects the following layout, verified
 against nndet/utils/check.py (_check_key_missing) and nndet/io/load.py:
 
     <out_root>/Task<NNN>_<name>/
-        dataset.json                         # task root — nnDetection v0.1 schema
+        dataset.json                           # task root — nnDetection v0.1 schema
         raw_splitted/
-            imagesTr/<case_id>_0000.nrrd     # volume with CANONICAL_SPACING_MM
-            labelsTr/<case_id>.nrrd          # binary mask label (uint8, {0,1})
-            labelsTr/<case_id>.json          # per-case instance→class JSON
-            imagesTs/<case_id>_0000.nrrd     # val/test images (inference only)
-        splits_final.json                    # nnDetection CV splits (see below)
+            imagesTr/<case_id>_0000.nii.gz     # volume with CANONICAL_SPACING_MM
+            labelsTr/<case_id>.nii.gz          # binary mask label (uint8, {0,1})
+            labelsTr/<case_id>.json            # per-case instance→class JSON
+            imagesTs/<case_id>_0000.nii.gz     # val/test images (inference only)
+        splits_final.json                      # nnDetection CV splits (see below)
 
 dataset.json schema (nnDetection v0.1, NOT nnUNet)
 ---------------------------------------------------
@@ -61,11 +76,18 @@ tensorImageSize, training, test.
 
 Per-case JSON sidecar (nnDetection v0.1 load.py requirement)
 -------------------------------------------------------------
-For every training case (labelsTr/<case>.nrrd), a sibling JSON is written:
+For every training case (labelsTr/<case>.nii.gz), a sibling JSON is written:
     labelsTr/<case>.json  →  {"instances": {"1": 0}}
 where key "1" is the binary mask value (lesion voxels = 1) and value 0 is the
 class index (labels["0"] = "tumor" — zero-indexed foreground).
 Source: nnDetection v0.1 nndet/io/load.py, load_case_cropped().
+
+nndet sidecar path derivation: ``seg_props_file = str(seg_file).split('.')[0] + '.json'``
+For a file ``0000.nii.gz``: split('.')[0] = ``raw_splitted/labelsTr/0000`` → sidecar
+is ``0000.json``. We use ``p.parent / (p.stem.split('.')[0] + '.json')`` which is
+the Python-idiomatic equivalent of nndet's string split (both strip the compound
+``.nii.gz`` suffix in a single step, unlike Path.with_suffix which only strips the
+last component and would yield ``.nii.json``).
 
 splits_final.json location
 ---------------------------
@@ -88,9 +110,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import nrrd
 import numpy as np
 import pandas as pd
+import SimpleITK as sitk
 
 from abus.data.split import load_split
 from abus.geometry.convert import csv_itk_to_bbox
@@ -110,21 +132,12 @@ log = logging.getLogger(__name__)
 _TASK_ID_DEFAULT: int = 1
 _TASK_NAME_DEFAULT: str = "Task001_TDSCABUS"
 
-# nnDetection image filenames follow: <case_id_4d>_<modality_idx_4d>.nrrd
+# nnDetection image filenames follow: <case_id_4d>_<modality_idx_4d>.nii.gz
 # Single modality (US): index 0000
+# .nii.gz is required: nndet v0.1 paths.py discovery globs *.nii.gz and its
+# SimpleITK-based loader reads NIfTI. .nrrd files are invisible to the discovery
+# layer (Round-4 fix, 2026-05-21; see module docstring).
 _MODALITY_IDX: str = "0000"
-
-# Base NRRD header for nnDetection image and label files.
-# Both file types use the same base (uint8, 3D, gzip, placeholder origin).
-# The space directions and sizes fields are filled in per file.
-_NNDET_HEADER_BASE: dict[str, Any] = {
-    "type": "unsigned char",
-    "dimension": 3,
-    "space": "3D-right-handed",
-    "kinds": ["space", "space", "space"],
-    "encoding": "gzip",
-    "space origin": [0.0, 0.0, 0.0],
-}
 
 
 # ---------------------------------------------------------------------------
@@ -191,68 +204,54 @@ class NndetDatasetSpec:
 
 
 def _canonical_image_name(case_id: int) -> str:
-    """nnDetection image filename for case_id: ``<case_id_4d>_0000.nrrd``."""
-    return f"{case_id:04d}_{_MODALITY_IDX}.nrrd"
+    """nnDetection image filename for case_id: ``<case_id_4d>_0000.nii.gz``."""
+    return f"{case_id:04d}_{_MODALITY_IDX}.nii.gz"
 
 
 def _canonical_label_name(case_id: int) -> str:
-    """nnDetection label filename for case_id: ``<case_id_4d>.nrrd``."""
-    return f"{case_id:04d}.nrrd"
+    """nnDetection label filename for case_id: ``<case_id_4d>.nii.gz``."""
+    return f"{case_id:04d}.nii.gz"
 
 
-def _make_spacing_header(spacing_mm: tuple[float, float, float]) -> list[list[float]]:
-    """Build the NRRD ``space directions`` diagonal matrix for given spacing."""
-    s0, s1, s2 = spacing_mm
-    return [
-        [s0, 0.0, 0.0],
-        [0.0, s1, 0.0],
-        [0.0, 0.0, s2],
-    ]
-
-
-def _write_image_nrrd(
+def _write_volume_nifti(
     path: str,
     array: np.ndarray,
     spacing_mm: tuple[float, float, float],
 ) -> None:
-    """Write a uint8 volume NRRD with the given physical spacing in the header.
+    """Write a uint8 volume as a compressed NIfTI (.nii.gz) with given spacing.
 
-    This is the spacing-injection step: the produced file's ``space directions``
-    diagonal equals ``spacing_mm``, NOT the identity placeholder.  nnDetection's
-    fingerprinting reads spacing from this header.
+    This is the spacing-injection step: the produced file's NIfTI pixdim header
+    encodes ``spacing_mm``, NOT the identity placeholder. nnDetection's
+    fingerprinting reads spacing from the NIfTI header.
+
+    Format choice (Round-4 fix, 2026-05-21): SimpleITK is used because it is
+    already a transitive dependency of nnDetection v0.1 and is available in both
+    the laptop env and the server nndet env. nibabel is not installed in either.
+    The NIfTI format stores spacing as IEEE 32-bit floats; round-trip precision
+    is ~1e-9 on CANONICAL_SPACING_MM, well within the 1e-6 verify gate.
+
+    SimpleITK axis convention:
+        ``GetImageFromArray(arr)`` reverses array axes: ``arr[d0, d1, d2]`` maps to
+        sitk internal axis order ``(d2, d1, d0)``.
+        ``SetSpacing`` takes ``(s_d2, s_d1, s_d0)`` (i.e. the sitk axis order).
+        Equivalently: ``spacing_sitk = (spacing_mm[2], spacing_mm[1], spacing_mm[0])``.
 
     Parameters
     ----------
     path:
-        Destination file path (will be created; parent must exist).
+        Destination file path ending in ``.nii.gz`` (parent must exist).
     array:
-        uint8 volume array, NRRD storage-axis order (d0, d1, d2).
+        uint8 volume array, storage-axis order (d0, d1, d2).
     spacing_mm:
-        Physical spacing to write into the NRRD header (d0, d1, d2), mm.
+        Physical spacing to encode in the NIfTI header (d0, d1, d2), mm.
     """
-    header: dict[str, Any] = dict(_NNDET_HEADER_BASE)
-    header["sizes"] = list(array.shape)
-    header["space directions"] = _make_spacing_header(spacing_mm)
-    nrrd.write(path, array, header)
+    img = sitk.GetImageFromArray(array.astype(np.uint8))
+    # sitk spacing is (x, y, z) = (d2, d1, d0) in our storage-axis convention
+    img.SetSpacing((float(spacing_mm[2]), float(spacing_mm[1]), float(spacing_mm[0])))
+    sitk.WriteImage(img, path)
 
 
-def _write_label_nrrd(
-    path: str,
-    array: np.ndarray,
-    spacing_mm: tuple[float, float, float],
-) -> None:
-    """Write a uint8 binary mask NRRD with correct physical spacing.
-
-    The label file carries the same spacing as the image file so that nnDetection
-    can overlay them on the same physical grid without re-projection.
-    """
-    header: dict[str, Any] = dict(_NNDET_HEADER_BASE)
-    header["sizes"] = list(array.shape)
-    header["space directions"] = _make_spacing_header(spacing_mm)
-    nrrd.write(path, array, header)
-
-
-def _write_per_case_json(label_nrrd_path: str) -> None:
+def _write_per_case_json(label_nii_path: str) -> None:
     """Write the nnDetection v0.1 per-case instance→class JSON sidecar.
 
     nnDetection v0.1 load.py (load_case_cropped) reads:
@@ -270,13 +269,24 @@ def _write_per_case_json(label_nrrd_path: str) -> None:
     in-scope assumption (confirmed from TDSC documentation and Train-split
     inspection during the 2026-05-18 review loop).
 
+    Sidecar path derivation for ``.nii.gz`` files (Round-4 fix):
+        nndet uses ``str(seg_file).split('.')[0] + '.json'``.
+        For ``0000.nii.gz`` this yields ``0000.json`` — the split strips both
+        ``.nii`` and ``.gz`` in one step. ``Path.with_suffix('.json')`` would
+        yield ``0000.nii.json`` (strips only ``.gz``), so we replicate nndet's
+        string split: ``p.parent / (p.stem.split('.')[0] + '.json')``.
+        For ``.nii.gz``, ``p.stem`` is ``0000.nii``; ``split('.')[0]`` is ``0000``.
+
     Parameters
     ----------
-    label_nrrd_path:
-        Path to the labelsTr/<case>.nrrd file. The sidecar is written as
-        the same path with .json replacing .nrrd.
+    label_nii_path:
+        Path to the labelsTr/<case>.nii.gz file.
     """
-    json_path = Path(label_nrrd_path).with_suffix(".json")
+    p = Path(label_nii_path)
+    # Replicate nndet load.py: str(seg_file).split('.')[0] + '.json'
+    # p.stem for '0000.nii.gz' is '0000.nii'; split('.')[0] is '0000'
+    case_id_str = p.stem.split(".")[0]
+    json_path = p.parent / f"{case_id_str}.json"
     with open(str(json_path), "w", encoding="utf-8") as f:
         json.dump({"instances": {"1": 0}}, f)
         f.write("\n")
@@ -361,11 +371,11 @@ def convert_case(
     Path(out_image_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_label_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Write image with CANONICAL_SPACING_MM injected into the NRRD header
-    _write_image_nrrd(out_image_path, vol_rec.array, CANONICAL_SPACING_MM)
+    # Write image as .nii.gz with CANONICAL_SPACING_MM in the NIfTI header
+    _write_volume_nifti(out_image_path, vol_rec.array, CANONICAL_SPACING_MM)
 
-    # Write label NRRD (binary mask, same spacing)
-    _write_label_nrrd(out_label_path, mask_rec.array, CANONICAL_SPACING_MM)
+    # Write label as .nii.gz (binary mask, same spacing)
+    _write_volume_nifti(out_label_path, mask_rec.array, CANONICAL_SPACING_MM)
 
     # Validate the CSV row and count lesions.
     # A dict has n_lesions=1; a list of dicts has n_lesions=len(list).
@@ -608,14 +618,14 @@ def export_dataset(
     # and nndet_prep at commit 97a58f3):
     #
     #   Task<NNN>_<name>/
-    #     dataset.json                       ← task root (NOT under raw_splitted)
-    #     splits_final.json                  ← written here; runbook copies to
-    #                                          preprocessed/ after nndet_prep runs
+    #     dataset.json                         ← task root (NOT under raw_splitted)
+    #     splits_final.json                    ← written here; runbook copies to
+    #                                            preprocessed/ after nndet_prep runs
     #     raw_splitted/
-    #       imagesTr/<case>_0000.nrrd        ← training images only (100 cases)
-    #       labelsTr/<case>.nrrd             ← binary mask labels
-    #       labelsTr/<case>.json             ← per-case instance→class sidecar
-    #       imagesTs/<case>_0000.nrrd        ← val/test images (inference only)
+    #       imagesTr/<case>_0000.nii.gz        ← training images only (100 cases)
+    #       labelsTr/<case>.nii.gz             ← binary mask labels
+    #       labelsTr/<case>.json               ← per-case instance→class sidecar
+    #       imagesTs/<case>_0000.nii.gz        ← val/test images (inference only)
     #
     # imagesTr + labelsTr hold training cases only (IDs in frozen 5-fold manifest).
     # imagesTs holds val+test; no labels written (batch inference targets).
@@ -739,7 +749,7 @@ def export_dataset(
                 # Val/test: write image only (spacing injection), no label
                 vol_rec = load_volume(str(vol_nrrd))
                 Path(out_image).parent.mkdir(parents=True, exist_ok=True)
-                _write_image_nrrd(out_image, vol_rec.array, CANONICAL_SPACING_MM)
+                _write_volume_nifti(out_image, vol_rec.array, CANONICAL_SPACING_MM)
                 # Count lesions for summary but don't write a label file
                 total_lesions += len(rows) if isinstance(rows, list) else 1
 
@@ -871,47 +881,45 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
             )
 
     # --- Check per-case JSON sidecar presence in raw_splitted/labelsTr/ ---
-    # nnDetection v0.1 load.py reads a sibling .json for every label NRRD.
-    # An interrupted or partial export can leave .nrrd files without sidecars;
+    # nnDetection v0.1 load.py reads a sibling .json for every label NIfTI file.
+    # An interrupted or partial export can leave .nii.gz files without sidecars;
     # those cases pass spacing and splits checks here but fail at nndet_prep time.
     labels_tr = task_dir / "raw_splitted" / "labelsTr"
     if labels_tr.exists():
-        for nrrd_file in sorted(labels_tr.glob("*.nrrd")):
-            json_sidecar = nrrd_file.with_suffix(".json")
+        for nii_file in sorted(labels_tr.glob("*.nii.gz")):
+            # Replicate nndet's sidecar path logic: str(seg_file).split('.')[0]+'.json'
+            case_id_str = nii_file.stem.split(".")[0]  # '0000.nii' -> '0000'
+            json_sidecar = nii_file.parent / f"{case_id_str}.json"
             if not json_sidecar.exists():
                 raise NndetDatasetError(
                     f"Missing per-case JSON sidecar: {json_sidecar}. "
                     "nnDetection v0.1 load.py requires a sibling .json for every "
-                    "label NRRD. Re-run export_dataset to regenerate sidecars."
+                    "label .nii.gz. Re-run export_dataset to regenerate sidecars."
                 )
 
     # --- Check spacing in raw_splitted/imagesTr/ ---
     # nnDetection v0.1 layout: images live under raw_splitted/imagesTr/
+    # Read spacing via SimpleITK (same library nndet uses in load.py).
+    # SimpleITK GetSpacing returns (x, y, z) = (d2, d1, d0) in our convention.
     images_tr = task_dir / "raw_splitted" / "imagesTr"
     n_images_checked = 0
     spacing_atol = 1e-6
 
     if images_tr.exists():
-        for img_path in sorted(images_tr.glob("*.nrrd")):
-            _, header = nrrd.read(str(img_path))
-            space_dirs = np.array(header.get("space directions", np.eye(3)), dtype=float)
-            # Check diagonal entries match CANONICAL_SPACING_MM
+        for img_path in sorted(images_tr.glob("*.nii.gz")):
+            img = sitk.ReadImage(str(img_path))
+            sp = img.GetSpacing()  # (x, y, z) = (d2, d1, d0)
+            # Map back to storage-axis order (d0, d1, d2) for comparison
+            actual_storage = (sp[2], sp[1], sp[0])
             for i, expected_sp in enumerate(CANONICAL_SPACING_MM):
-                actual_sp = space_dirs[i, i]
+                actual_sp = actual_storage[i]
                 if abs(actual_sp - expected_sp) > spacing_atol:
                     raise NndetDatasetError(
                         f"Spacing mismatch in {img_path.name}: "
-                        f"axis {i} got {actual_sp:.6f} mm, expected {expected_sp:.6f} mm. "
+                        f"axis {i} got {actual_sp:.9f} mm, expected {expected_sp:.9f} mm "
+                        f"(diff={abs(actual_sp - expected_sp):.2e}, atol={spacing_atol:.2e}). "
                         "nnDetection will resample on a wrong grid."
                     )
-            # Check off-diagonal entries are zero (no shear)
-            for i in range(3):
-                for j in range(3):
-                    if i != j and abs(space_dirs[i, j]) > spacing_atol:
-                        raise NndetDatasetError(
-                            f"Non-zero off-diagonal in space directions of {img_path.name}: "
-                            f"[{i},{j}] = {space_dirs[i,j]:.6g}. Expected diagonal matrix."
-                        )
             n_images_checked += 1
 
     log.info(
@@ -996,8 +1004,8 @@ def _dry_run(case_dir: str, out_dir: str) -> None:
 
     csv_arg: Any = rows[0] if len(rows) == 1 else rows
 
-    out_image = str(out_path / _canonical_image_name(case_id))
-    out_label = str(out_path / _canonical_label_name(case_id))
+    out_image = str(out_path / _canonical_image_name(case_id))  # <case>_0000.nii.gz
+    out_label = str(out_path / _canonical_label_name(case_id))  # <case>.nii.gz
 
     result = convert_case(vol_path, mask_path, csv_arg, out_image, out_label)
 

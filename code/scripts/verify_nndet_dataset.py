@@ -81,9 +81,8 @@ def main() -> None:
             log.error("--case-id requires --tdsc-root to locate bbx_labels.csv.")
             sys.exit(1)
 
-        import nrrd
-        import numpy as np
         import pandas as pd
+        import SimpleITK as sitk
 
         from abus.detect.nndet_convention import bbox_original_roundtrip
         from abus.geometry.convert import csv_itk_to_bbox
@@ -113,11 +112,10 @@ def main() -> None:
             log.error("Case %d not found in any split's bbx_labels.csv.", case_id)
             sys.exit(1)
 
-        # Load the nnDetection image to get the actual target grid spacing
-        # nnDetection v0.1 layout: images under raw_splitted/imagesTr/
-        img_path = task_dir / "raw_splitted" / "imagesTr" / f"{case_id:04d}_0000.nrrd"
+        # Load the nnDetection image to get the actual target grid spacing.
+        # nnDetection v0.1 layout: images under raw_splitted/imagesTr/ as .nii.gz
+        img_path = task_dir / "raw_splitted" / "imagesTr" / f"{case_id:04d}_0000.nii.gz"
         if not img_path.exists():
-            # Try imagesTr for the resampled preprocessed file if nndet_prep has run
             log.warning(
                 "Original image not found at %s. "
                 "Using CANONICAL_SPACING_MM as both original and target "
@@ -126,9 +124,10 @@ def main() -> None:
             )
             target_spacing = CANONICAL_SPACING_MM
         else:
-            _, header = nrrd.read(str(img_path))
-            space_dirs = np.array(header.get("space directions", np.eye(3)), dtype=float)
-            target_spacing = (space_dirs[0, 0], space_dirs[1, 1], space_dirs[2, 2])
+            # SimpleITK GetSpacing returns (x, y, z) = (d2, d1, d0) in our convention
+            img = sitk.ReadImage(str(img_path))
+            sp = img.GetSpacing()
+            target_spacing = (sp[2], sp[1], sp[0])  # -> (d0, d1, d2) storage order
             log.info("Target spacing from image header: %s mm", target_spacing)
 
         recovered = bbox_original_roundtrip(gt_bbox, target_spacing)

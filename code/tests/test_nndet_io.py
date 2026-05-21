@@ -61,6 +61,7 @@ from pathlib import Path
 import nrrd
 import numpy as np
 import pytest
+import SimpleITK as sitk
 
 # ---------------------------------------------------------------------------
 # Imports under test — these will fail until the modules are implemented.
@@ -310,31 +311,26 @@ def test_spacing_written(tmp_path: Path) -> None:
 
     csv_row = _make_csv_row(case_id, lesion_box)
 
-    out_image = str(tmp_path / "image_0042_0000.nrrd")
-    out_label = str(tmp_path / "label_0042.nrrd")
+    out_image = str(tmp_path / "image_0042_0000.nii.gz")
+    out_label = str(tmp_path / "label_0042.nii.gz")
 
     convert_case(vol_path, mask_path, csv_row, out_image, out_label)
 
-    # Read back the written image and inspect its header spacing
-    _, header = nrrd.read(out_image)
-    space_dirs = np.array(header["space directions"], dtype=float)
+    # Read back the written image and inspect its spacing via SimpleITK.
+    # sitk.GetSpacing returns (x, y, z) = (d2, d1, d0) in our storage convention.
+    img = sitk.ReadImage(out_image)
+    sp = img.GetSpacing()  # (d2, d1, d0)
+    actual_storage = (sp[2], sp[1], sp[0])  # -> (d0, d1, d2)
 
-    # Diagonal must equal CANONICAL_SPACING_MM
+    # NIfTI float32 precision: tolerance is 1e-6 (not 1e-9 as in NRRD)
+    spacing_atol = 1e-6
     for i, expected_sp in enumerate(CANONICAL_SPACING_MM):
-        actual_sp = space_dirs[i, i]
-        assert abs(actual_sp - expected_sp) < 1e-9, (
-            f"Axis {i} spacing mismatch: got {actual_sp}, expected {expected_sp}. "
-            "convert_case must write CANONICAL_SPACING_MM, not identity spacing."
+        actual_sp = actual_storage[i]
+        assert abs(actual_sp - expected_sp) < spacing_atol, (
+            f"Axis {i} spacing mismatch: got {actual_sp:.9f}, expected {expected_sp:.9f} "
+            f"(diff={abs(actual_sp - expected_sp):.2e}). "
+            "convert_case must write CANONICAL_SPACING_MM into the NIfTI header."
         )
-
-    # Off-diagonal must be zero (pure diagonal spacing, no shear)
-    for i in range(3):
-        for j in range(3):
-            if i != j:
-                assert abs(space_dirs[i, j]) < 1e-9, (
-                    f"Off-diagonal spacing[{i},{j}]={space_dirs[i,j]} != 0 — "
-                    "spacing matrix must be diagonal."
-                )
 
 
 # ===========================================================================
@@ -360,8 +356,8 @@ def test_convert_case_lesion_count(tmp_path: Path) -> None:
 
     csv_row = _make_csv_row(case_id, lesion_box)
 
-    out_image = str(tmp_path / "image_0007_0000.nrrd")
-    out_label = str(tmp_path / "label_0007.nrrd")
+    out_image = str(tmp_path / "image_0007_0000.nii.gz")
+    out_label = str(tmp_path / "label_0007.nii.gz")
 
     result = convert_case(vol_path, mask_path, csv_row, out_image, out_label)
 
@@ -401,8 +397,8 @@ def test_loader_guard_propagates(tmp_path: Path) -> None:
     lesion_box = BBox(1, 2, 3, 3, 5, 6)
     csv_row = _make_csv_row(case_id, lesion_box)
 
-    out_image = str(tmp_path / "image_0099_0000.nrrd")
-    out_label = str(tmp_path / "label_0099.nrrd")
+    out_image = str(tmp_path / "image_0099_0000.nii.gz")
+    out_label = str(tmp_path / "label_0099.nii.gz")
 
     with pytest.raises(SpacingPlaceholderError):
         convert_case(vol_path, mask_path, csv_row, out_image, out_label)
@@ -614,8 +610,8 @@ def test_convert_case_empty_csv_row_raises(tmp_path: Path) -> None:
     _write_identity_volume_nrrd(vol_path)
     _write_identity_mask_nrrd(mask_path)
 
-    out_image = str(tmp_path / "image_0055_0000.nrrd")
-    out_label = str(tmp_path / "label_0055.nrrd")
+    out_image = str(tmp_path / "image_0055_0000.nii.gz")
+    out_label = str(tmp_path / "label_0055.nii.gz")
 
     with pytest.raises(ValueError, match="empty list"):
         convert_case(vol_path, mask_path, [], out_image, out_label)
@@ -637,8 +633,8 @@ def test_convert_case_invalid_csv_row_raises(tmp_path: Path) -> None:
     _write_identity_volume_nrrd(vol_path)
     _write_identity_mask_nrrd(mask_path)
 
-    out_image = str(tmp_path / "image_0056_0000.nrrd")
-    out_label = str(tmp_path / "label_0056.nrrd")
+    out_image = str(tmp_path / "image_0056_0000.nii.gz")
+    out_label = str(tmp_path / "label_0056.nii.gz")
 
     incomplete_row = {"id": 56, "c_x": 5.0}  # missing c_y, c_z, len_x, len_y, len_z
 
@@ -771,13 +767,13 @@ def test_export_dataset_handles_nested_train_shards(tmp_path: Path) -> None:
     # Every training case must have produced both an image and a label
     # nnDetection v0.1 layout: under raw_splitted/
     task_dir = Path(result["task_dir"])
-    images_tr = sorted((task_dir / "raw_splitted" / "imagesTr").glob("*.nrrd"))
-    labels_tr = sorted((task_dir / "raw_splitted" / "labelsTr").glob("*.nrrd"))
+    images_tr = sorted((task_dir / "raw_splitted" / "imagesTr").glob("*.nii.gz"))
+    labels_tr = sorted((task_dir / "raw_splitted" / "labelsTr").glob("*.nii.gz"))
     assert len(images_tr) == 5, f"Expected 5 imagesTr files, got {len(images_tr)}"
     assert len(labels_tr) == 5, f"Expected 5 labelsTr files, got {len(labels_tr)}"
 
     # Val + test images live under raw_splitted/imagesTs (no labels)
-    images_ts = sorted((task_dir / "raw_splitted" / "imagesTs").glob("*.nrrd"))
+    images_ts = sorted((task_dir / "raw_splitted" / "imagesTs").glob("*.nii.gz"))
     assert len(images_ts) == 3, f"Expected 3 imagesTs files (val+test), got {len(images_ts)}"
 
 
@@ -1060,9 +1056,9 @@ def test_export_dataset_raw_splitted_layout(tmp_path: Path) -> None:
     ).exists(), f"imagesTr/ must NOT exist directly under {task_dir} (old wrong layout)"
 
     # Correct file counts
-    images_tr = sorted((raw_splitted / "imagesTr").glob("*.nrrd"))
-    labels_tr = sorted((raw_splitted / "labelsTr").glob("*.nrrd"))
-    images_ts = sorted((raw_splitted / "imagesTs").glob("*.nrrd"))
+    images_tr = sorted((raw_splitted / "imagesTr").glob("*.nii.gz"))
+    labels_tr = sorted((raw_splitted / "labelsTr").glob("*.nii.gz"))
+    images_ts = sorted((raw_splitted / "imagesTs").glob("*.nii.gz"))
     assert len(images_tr) == 2, f"Expected 2 imagesTr files, got {len(images_tr)}"
     assert len(labels_tr) == 2, f"Expected 2 labelsTr files, got {len(labels_tr)}"
     assert len(images_ts) == 2, f"Expected 2 imagesTs files (val+test), got {len(images_ts)}"
@@ -1119,14 +1115,17 @@ def test_export_dataset_per_case_json_sidecar(tmp_path: Path) -> None:
     task_dir = tmp_path / "out" / "Task001_TDSCABUS"
     labels_tr = task_dir / "raw_splitted" / "labelsTr"
 
-    nrrd_files = sorted(labels_tr.glob("*.nrrd"))
-    assert len(nrrd_files) == 3, f"Expected 3 labelsTr NRRD files, got {len(nrrd_files)}"
+    nii_files = sorted(labels_tr.glob("*.nii.gz"))
+    assert len(nii_files) == 3, f"Expected 3 labelsTr .nii.gz files, got {len(nii_files)}"
 
-    for nrrd_file in nrrd_files:
-        json_sidecar = nrrd_file.with_suffix(".json")
+    for nii_file in nii_files:
+        # nndet sidecar logic: str(seg_file).split('.')[0] + '.json'
+        # For '0000.nii.gz': stem='0000.nii', split('.')[0]='0000' -> '0000.json'
+        case_id_str = nii_file.stem.split(".")[0]
+        json_sidecar = nii_file.parent / f"{case_id_str}.json"
         assert json_sidecar.exists(), (
-            f"Missing per-case JSON sidecar for {nrrd_file.name}. "
-            "nnDetection v0.1 load.py reads seg_props_file = stem + '.json' "
+            f"Missing per-case JSON sidecar {case_id_str}.json for {nii_file.name}. "
+            "nnDetection v0.1 load.py reads seg_props_file = str(seg_file).split('.')[0]+'.json' "
             "and crashes if it is absent."
         )
 
@@ -1282,8 +1281,8 @@ def test_convert_case_multi_lesion_raises_before_sidecar(tmp_path: Path) -> None
     lesion_box = BBox(2, 3, 4, 4, 6, 7)
     _write_identity_mask_nrrd(mask_path, lesion_box=lesion_box)
 
-    out_image = str(tmp_path / "0010_0000.nrrd")
-    out_label = str(tmp_path / "0010.nrrd")
+    out_image = str(tmp_path / "0010_0000.nii.gz")
+    out_label = str(tmp_path / "0010.nii.gz")
     expected_sidecar = tmp_path / "0010.json"
 
     # Two CSV rows = two lesions
@@ -1346,6 +1345,11 @@ def test_verify_nndet_dataset_detects_missing_sidecar(tmp_path: Path) -> None:
     labels_tr = task_dir / "raw_splitted" / "labelsTr"
     sidecars = sorted(labels_tr.glob("*.json"))
     assert len(sidecars) == 2, f"Export should have produced 2 sidecars, got {len(sidecars)}"
+    # Also verify the .nii.gz label files exist (not .nrrd)
+    nii_labels = sorted(labels_tr.glob("*.nii.gz"))
+    assert (
+        len(nii_labels) == 2
+    ), f"Export should have produced 2 .nii.gz labels, got {len(nii_labels)}"
 
     # Simulate a missing sidecar (e.g. interrupted export)
     sidecars[0].unlink()
@@ -1381,6 +1385,121 @@ def test_verify_nndet_dataset_detects_missing_sidecar(tmp_path: Path) -> None:
 #     cfg["task"]           (already in schema)
 #     cfg["data"]["labels"] (already in schema)
 # ===========================================================================
+
+
+# ===========================================================================
+# Test 25 — nndet discovery compatibility: export_dataset output visible to nndet's glob
+#
+# TDD evidence: WRITTEN BEFORE fix. Fails on current .nrrd output because:
+#   - nndet v0.1 paths.py globs *.nii.gz in imagesTr/ and labelsTr/
+#   - our .nrrd files are invisible to that glob
+#   - this is the root cause of the "0it [00:00, ?it/s]" data-and-label check
+#
+# This test replicates nndet's discovery logic locally (no nndet import — it is
+# not installed in the laptop env) against a tiny synthetic export and asserts:
+#   1. imagesTr/*.nii.gz glob finds >= 1 file
+#   2. case_id extraction (strip .nii.gz, strip last 5 chars _0000) is consistent
+#   3. For each case_id, labelsTr/<case>.nii.gz exists
+#   4. For each case_id, labelsTr/<case>.json exists with {"instances": {"1": 0}}
+# ===========================================================================
+
+
+def test_nndet_discovery_compatibility(tmp_path: Path) -> None:
+    """After export_dataset, nndet's *.nii.gz discovery globs find all training cases.
+
+    nndet v0.1 paths.py discovery logic (get_case_ids_from_dir):
+        - globs ``imagesTr/*.nii.gz``
+        - strips ``.nii.gz`` suffix: ``0000_0000.nii.gz`` -> ``0000_0000``
+        - strips the last 5 characters (modality suffix ``_0000``): -> ``0000``
+        - returns case_ids as strings (here tested as zero-padded 4-digit ints)
+
+    The 0it [00:00, ?it/s] failure (Round 4) happened because nndet never found
+    our .nrrd files — the glob returned 0 results. This test makes that class of
+    failure impossible to reintroduce silently.
+    """
+    tdsc_root = tmp_path / "tdsc"
+    _build_synthetic_tdsc_root(
+        tdsc_root,
+        train_shards={"DATA00_49": [0, 1, 2]},
+        val_ids=[100],
+        test_ids=[200],
+    )
+
+    out_root = tmp_path / "out"
+    spec = NndetDatasetSpec(
+        task_id=1,
+        task_name="Task001_TDSCABUS",
+        n_train_cases=3,
+        n_val_cases=1,
+        n_test_cases=1,
+        spacing_mm=CANONICAL_SPACING_MM,
+        modality="US",
+        label_semantics="tumor",
+    )
+
+    export_dataset(str(tdsc_root), str(out_root), spec)
+
+    task_dir = tmp_path / "out" / "Task001_TDSCABUS"
+    images_tr = task_dir / "raw_splitted" / "imagesTr"
+    labels_tr = task_dir / "raw_splitted" / "labelsTr"
+
+    # --- 1. nndet's glob must find *.nii.gz images ---
+    nii_images = sorted(images_tr.glob("*.nii.gz"))
+    assert len(nii_images) >= 1, (
+        f"nndet's glob 'imagesTr/*.nii.gz' found 0 files in {images_tr}. "
+        "This is the root cause of '0it [00:00, ?it/s]' in the data-and-label check. "
+        f"Files actually present: {sorted(images_tr.iterdir())}"
+    )
+    assert (
+        len(nii_images) == 3
+    ), f"Expected 3 imagesTr/*.nii.gz files, got {len(nii_images)}: {nii_images}"
+
+    # --- 2. Apply nndet's case_id extraction logic ---
+    # nndet: strip '.nii.gz' -> strip last 5 chars (_0000 modality suffix)
+    extracted_ids = []
+    for p in nii_images:
+        name = p.name  # e.g. "0000_0000.nii.gz"
+        assert name.endswith(
+            ".nii.gz"
+        ), f"imagesTr file {name!r} does not end in .nii.gz — nndet will not discover it"
+        without_ext = name[: -len(".nii.gz")]  # "0000_0000"
+        case_id_str = without_ext[:-5]  # strip "_0000" -> "0000"
+        extracted_ids.append(case_id_str)
+
+    assert len(extracted_ids) == 3, f"Expected to extract 3 case IDs, got {extracted_ids}"
+
+    # --- 3 & 4. For each extracted case_id: labelsTr/<case>.nii.gz + .json must exist ---
+    for case_id_str in extracted_ids:
+        label_nii = labels_tr / f"{case_id_str}.nii.gz"
+        assert label_nii.exists(), (
+            f"nndet expects labelsTr/{case_id_str}.nii.gz but it is absent. "
+            f"Files in labelsTr: {sorted(labels_tr.iterdir())}"
+        )
+
+        label_json = labels_tr / f"{case_id_str}.json"
+        assert label_json.exists(), (
+            f"nndet expects labelsTr/{case_id_str}.json sidecar but it is absent. "
+            f"The sidecar must be named <case_id>.json (matching nndet load.py: "
+            f"str(seg_file).split('.')[0] + '.json')."
+        )
+
+        with open(label_json, encoding="utf-8") as f:
+            props = json.load(f)
+        assert props == {"instances": {"1": 0}}, (
+            f'Sidecar {case_id_str}.json must be {{"instances": {{"1": 0}}}}, ' f"got {props}"
+        )
+
+    # --- 5. SimpleITK round-trip spacing check for one image ---
+    import SimpleITK as sitk  # available in the laptop env (verified 2026-05-21)
+
+    img = sitk.ReadImage(str(nii_images[0]))
+    sp = img.GetSpacing()  # (x, y, z) = (d2, d1, d0) in SimpleITK convention
+    recovered_storage = (sp[2], sp[1], sp[0])  # -> (d0, d1, d2) storage order
+    for i, (exp, got) in enumerate(zip(CANONICAL_SPACING_MM, recovered_storage, strict=False)):
+        assert abs(exp - got) < 1e-6, (
+            f"Spacing axis {i}: expected {exp}, got {got} (diff={abs(exp-got):.2e}). "
+            "NIfTI float32 precision must not exceed 1e-6 tolerance."
+        )
 
 
 def test_dataset_json_has_preprocess_read_contract(tmp_path: Path) -> None:
