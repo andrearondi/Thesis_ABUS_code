@@ -16,9 +16,13 @@ n_train_cases: 100
 n_val_cases: 30
 n_test_cases: 70
 
-# Canonical physical voxel spacing, storage-axis order (d0, d1, d2), mm.
+# Native physical voxel spacing of the TDSC-ABUS-2023 source NRRDs,
+# storage-axis order (d0, d1, d2), mm.
 # Source: docs/local_data.md, official TDSC-ABUS-2023 challenge description,
 # thesis §3.2.4. NEVER use the NRRD header spacing (placeholder identity).
+# This is the spacing the EPIC_00 loader injects at the I/O boundary BEFORE
+# any resampling. Use `target_spacing_mm` below for what is WRITTEN to the
+# nnDetection .nii.gz files (post-resample). See `resampling_policy` notes.
 spacing_mm:
   - 0.073
   - 0.200
@@ -31,10 +35,63 @@ modality: "US"
 label_semantics: "single foreground class: tumor"
 
 # Resampling target grid policy
-# "nndet_default" = nnDetection self-configuring fingerprint; no override.
-# Rationale: thesis §3.2.3/§3.2.4 — "internal optimisation of the candidate
-# generator beyond the framework defaults is explicitly out of scope."
-resampling_policy: "nndet_default"
+# ============================================================================
+# "explicit_target_spacing" — `convert_case` resamples each volume to
+# `target_spacing_mm` (below) BEFORE writing the .nii.gz file ingested by
+# nndet_prep. The written .nii.gz NIfTI pixdim equals target_spacing_mm;
+# nndet_prep's data fingerprint will therefore report
+# `spacing_after_resampling ≈ target_spacing_mm` (post-rounding), and the
+# c002 planner's initial-patch heuristic seats on the already-down-sampled
+# median shape rather than the native (~205M-voxel) shape.
+#
+# Why not "nndet_default": the native ABUS spacing yields a median shape of
+# ~(865, 682, 348) = ~205M voxels per volume; the c002 architecture planner's
+# initial-patch heuristic (seeded from the dataset median shape) overshoots
+# the planner's 11 GB memory target by ~10x. Empirically (server, 2026-05-22
+# and 2026-05-23), the OOM-recovery probe loop in c002 corrupts the CUDA
+# context after 3–4 OOMs and the planner crashes before reaching a feasible
+# patch. nndet v0.1 ships only the c002 architecture planner and the v001
+# experiment planner; there is no higher-capacity planner to switch to.
+# See docs/decisions_log.md entry 2026-05-25 for the full root-cause analysis.
+#
+# How target_spacing_mm = (0.3, 0.3, 0.5) was chosen:
+#   - Smallest empirical lesion dimension in TDSC-ABUS-2023 (local validation
+#     sample, case 102 axis 0): 4.5 mm. Nyquist-style heuristic (voxel ≤
+#     smallest_dim / 4): chosen voxel ≤ 1.1 mm. (0.3, 0.3, 0.5) is well below
+#     this on every axis.
+#   - Preserves the directional asymmetry that the thesis directional Δr
+#     hypothesis (§3.2.4, §3.2.7, Gate B) depends on: 0.3 mm on d0 (ẑ,
+#     acoustic-depth axis) remains strictly finer than 0.5 mm on d2 (sweep
+#     axis). Anisotropy ratio 1.67:1; native ratio is 6.85:1.
+#   - d0 downsample factor 0.3 / 0.073 ≈ 4.1×. Thesis §3.2.4 explicitly
+#     rejected "0.4 mm isotropic ... would downsample the 0.073 mm axis by
+#     a factor of about 5.5"; 4.1× sits below that rejected threshold and
+#     does not impose global isotropy.
+#   - Median resampled shape ≈ (210, 455, 331) ≈ 31.6M voxels per case
+#     (6.5× reduction). c002's initial patch should now seat in feasible
+#     OOM-free probe range.
+#   - Δr / |ê₁·ẑ| are computed in physical mm at the candidate-graph stage
+#     (thesis §3.2.4, §3.2.7), so they are invariant under any rigid voxel
+#     grid choice; Stage 0 Gate B is preserved.
+#
+# Storage-axis order (d0, d1, d2), mm. Identity policy ("equal to spacing_mm")
+# is a backwards-compatibility no-op. Do not set values that downsample d0
+# by more than ~4.5× from native — that crosses the thesis §3.2.4 rejection
+# threshold.
+resampling_policy: "explicit_target_spacing"
+target_spacing_mm:
+  - 0.3
+  - 0.3
+  - 0.5
+
+# Resampling interpolation:
+# - "linear" for the image (continuous intensities, standard for ultrasound).
+# - "nearest" for the binary mask (preserves {0,1} label values; no fractional
+#    labels).
+# These map to SimpleITK sitkLinear / sitkNearestNeighbor respectively.
+resample_interpolation:
+  image: "linear"
+  mask: "nearest"
 
 # nnDetection version and commit hash — FILLED IN DURING RUNBOOK EXECUTION
 # (see nndet_planning_notes.md and ASC-01_01.6).

@@ -90,6 +90,10 @@ from abus.io.loader import CANONICAL_SPACING_MM, SpacingPlaceholderError
 
 _SMALL_SHAPE = (8, 10, 12)  # (d0, d1, d2) — small enough for fast tests
 
+# D01.7 target spacing (storage-axis order: d0, d1, d2), mm.
+# Architect decision 2026-05-25: fixes c002 planner convergence failure on native spacing.
+TARGET_SPACING_MM: tuple[float, float, float] = (0.3, 0.3, 0.5)
+
 
 def _write_identity_volume_nrrd(path: str, shape: tuple[int, int, int] = _SMALL_SHAPE) -> None:
     """Write a minimal uint8 DATA_<N>.nrrd with identity placeholder header."""
@@ -293,12 +297,12 @@ def test_splits_file_faithful(tmp_path: Path) -> None:
 
 
 def test_spacing_written(tmp_path: Path) -> None:
-    """convert_case writes CANONICAL_SPACING_MM into the nnDetection image file.
+    """convert_case writes TARGET_SPACING_MM into the nnDetection image file.
 
-    The nnDetection fingerprint reads spacing from the written image; if the
-    converter writes identity spacing nnDetection will resample on a wrong grid
-    (Risk 1 in the story). This test reads back the written NRRD and asserts
-    the space directions diagonal equals CANONICAL_SPACING_MM.
+    ASC-01_01.2 (amended D01.7, 2026-05-25): the written .nii.gz pixdim must equal
+    TARGET_SPACING_MM = (0.3, 0.3, 0.5) mm, NOT CANONICAL_SPACING_MM. The nnDetection
+    fingerprint reads spacing from the written image; the target spacing seeds c002's
+    patch heuristic at the post-resample (feasible) median shape.
     """
     # Setup synthetic case 42
     case_id = 42
@@ -314,7 +318,9 @@ def test_spacing_written(tmp_path: Path) -> None:
     out_image = str(tmp_path / "image_0042_0000.nii.gz")
     out_label = str(tmp_path / "label_0042.nii.gz")
 
-    convert_case(vol_path, mask_path, csv_row, out_image, out_label)
+    convert_case(
+        vol_path, mask_path, csv_row, out_image, out_label, target_spacing_mm=TARGET_SPACING_MM
+    )
 
     # Read back the written image and inspect its spacing via SimpleITK.
     # sitk.GetSpacing returns (x, y, z) = (d2, d1, d0) in our storage convention.
@@ -324,12 +330,12 @@ def test_spacing_written(tmp_path: Path) -> None:
 
     # NIfTI float32 precision: tolerance is 1e-6 (not 1e-9 as in NRRD)
     spacing_atol = 1e-6
-    for i, expected_sp in enumerate(CANONICAL_SPACING_MM):
+    for i, expected_sp in enumerate(TARGET_SPACING_MM):
         actual_sp = actual_storage[i]
         assert abs(actual_sp - expected_sp) < spacing_atol, (
             f"Axis {i} spacing mismatch: got {actual_sp:.9f}, expected {expected_sp:.9f} "
             f"(diff={abs(actual_sp - expected_sp):.2e}). "
-            "convert_case must write CANONICAL_SPACING_MM into the NIfTI header."
+            "convert_case must write TARGET_SPACING_MM into the NIfTI header after D01.7."
         )
 
 
@@ -366,9 +372,10 @@ def test_convert_case_lesion_count(tmp_path: Path) -> None:
         "The convert_case summary dict must report the correct lesion count."
     )
     assert result["case_id"] == case_id, f"Expected case_id={case_id}, got {result['case_id']}"
+    # After D01.7: spacing_written is target_spacing_mm, not CANONICAL_SPACING_MM.
     assert (
-        result["spacing_written"] == CANONICAL_SPACING_MM
-    ), f"Expected spacing_written={CANONICAL_SPACING_MM}, got {result['spacing_written']}"
+        result["spacing_written"] == TARGET_SPACING_MM
+    ), f"Expected spacing_written={TARGET_SPACING_MM}, got {result['spacing_written']}"
 
     # The label file must exist
     assert Path(out_label).exists(), f"Label file not written: {out_label}"
@@ -468,6 +475,9 @@ def test_dataset_spec_fields() -> None:
         n_val_cases=30,
         n_test_cases=70,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="single foreground class: tumor",
     )
@@ -477,6 +487,10 @@ def test_dataset_spec_fields() -> None:
     assert spec.n_val_cases == 30
     assert spec.n_test_cases == 70
     assert spec.spacing_mm == CANONICAL_SPACING_MM
+    # D01.7 fields (2026-05-25)
+    assert spec.target_spacing_mm == TARGET_SPACING_MM
+    assert spec.resample_image_interp == "linear"
+    assert spec.resample_mask_interp == "nearest"
     assert spec.modality == "US"
 
     # Must be frozen (immutable)
@@ -503,6 +517,9 @@ def test_build_dataset_json(tmp_path: Path) -> None:
         n_val_cases=30,
         n_test_cases=70,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="single foreground class: tumor",
     )
@@ -751,6 +768,9 @@ def test_export_dataset_handles_nested_train_shards(tmp_path: Path) -> None:
         n_val_cases=2,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -806,6 +826,9 @@ def test_export_dataset_raises_on_train_count_mismatch(tmp_path: Path) -> None:
         n_val_cases=1,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -876,6 +899,9 @@ def test_export_dataset_tolerates_mask_padding_skew(tmp_path: Path) -> None:
         n_val_cases=1,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -925,6 +951,9 @@ def test_build_dataset_json_nndet_v01_schema(tmp_path: Path) -> None:
         n_val_cases=30,
         n_test_cases=70,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="single foreground class: tumor",
     )
@@ -1025,6 +1054,9 @@ def test_export_dataset_raw_splitted_layout(tmp_path: Path) -> None:
         n_val_cases=1,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -1106,6 +1138,9 @@ def test_export_dataset_per_case_json_sidecar(tmp_path: Path) -> None:
         n_val_cases=1,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -1172,6 +1207,9 @@ def test_dataset_json_passes_nndet_check_replica(tmp_path: Path) -> None:
         n_val_cases=30,
         n_test_cases=70,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="single foreground class: tumor",
     )
@@ -1335,6 +1373,9 @@ def test_verify_nndet_dataset_detects_missing_sidecar(tmp_path: Path) -> None:
         n_val_cases=1,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -1433,6 +1474,9 @@ def test_nndet_discovery_compatibility(tmp_path: Path) -> None:
         n_val_cases=1,
         n_test_cases=1,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="tumor",
     )
@@ -1490,15 +1534,17 @@ def test_nndet_discovery_compatibility(tmp_path: Path) -> None:
         )
 
     # --- 5. SimpleITK round-trip spacing check for one image ---
+    # After D01.7, written spacing is TARGET_SPACING_MM, not CANONICAL_SPACING_MM.
     import SimpleITK as sitk  # available in the laptop env (verified 2026-05-21)
 
     img = sitk.ReadImage(str(nii_images[0]))
     sp = img.GetSpacing()  # (x, y, z) = (d2, d1, d0) in SimpleITK convention
     recovered_storage = (sp[2], sp[1], sp[0])  # -> (d0, d1, d2) storage order
-    for i, (exp, got) in enumerate(zip(CANONICAL_SPACING_MM, recovered_storage, strict=False)):
+    for i, (exp, got) in enumerate(zip(TARGET_SPACING_MM, recovered_storage, strict=False)):
         assert abs(exp - got) < 1e-6, (
-            f"Spacing axis {i}: expected {exp}, got {got} (diff={abs(exp-got):.2e}). "
-            "NIfTI float32 precision must not exceed 1e-6 tolerance."
+            f"Spacing axis {i}: expected target {exp}, got {got} (diff={abs(exp-got):.2e}). "
+            "NIfTI float32 precision must not exceed 1e-6 tolerance. "
+            "After D01.7, written spacing is TARGET_SPACING_MM, not CANONICAL_SPACING_MM."
         )
 
 
@@ -1532,6 +1578,9 @@ def test_dataset_json_has_preprocess_read_contract(tmp_path: Path) -> None:
         n_val_cases=30,
         n_test_cases=70,
         spacing_mm=CANONICAL_SPACING_MM,
+        target_spacing_mm=TARGET_SPACING_MM,
+        resample_image_interp="linear",
+        resample_mask_interp="nearest",
         modality="US",
         label_semantics="single foreground class: tumor",
     )
@@ -1572,3 +1621,193 @@ def test_dataset_json_has_preprocess_read_contract(tmp_path: Path) -> None:
         f"test_labels must be False (no labelsTs/ provided; thesis §3.2 held-out eval). "
         f"Got: {data['test_labels']!r}"
     )
+
+
+# ===========================================================================
+# Test 26 — D01.7 resampling: convert_case writes TARGET_SPACING_MM to NIfTI
+#
+# NEW (D01.7, 2026-05-25): convert_case must resample the volume to
+# target_spacing_mm=(0.3, 0.3, 0.5) and write that spacing into the
+# NIfTI pixdim header. The old behaviour was to write CANONICAL_SPACING_MM.
+#
+# TDD evidence: WRITTEN BEFORE implementation. Fails because:
+#   - convert_case does not yet accept target_spacing_mm parameter
+#   - convert_case writes CANONICAL_SPACING_MM, not (0.3, 0.3, 0.5)
+# ===========================================================================
+
+
+def test_resample_writes_target_spacing(tmp_path: Path) -> None:
+    """convert_case resamples to target_spacing_mm and writes that spacing into the NIfTI header.
+
+    ASC-01_01.2 (amended D01.7): the written .nii.gz pixdim must equal target_spacing_mm
+    within 1e-6 (NIfTI float32 precision). The native CANONICAL_SPACING_MM must NOT
+    appear in the written header after D01.7.
+
+    Also verifies the written shape is consistent with
+        round(native_shape * native_spacing / target_spacing)
+    element-wise, confirming the resampling grid changed.
+    """
+    case_id = 42
+    native_shape = _SMALL_SHAPE  # (8, 10, 12)
+    vol_path = str(tmp_path / "DATA_0042.nrrd")
+    mask_path = str(tmp_path / "MASK_0042.nrrd")
+
+    lesion_box = BBox(2, 3, 4, 4, 6, 7)
+    _write_identity_volume_nrrd(vol_path, shape=native_shape)
+    _write_identity_mask_nrrd(mask_path, shape=native_shape, lesion_box=lesion_box)
+
+    csv_row = _make_csv_row(case_id, lesion_box)
+
+    out_image = str(tmp_path / "image_0042_0000.nii.gz")
+    out_label = str(tmp_path / "label_0042.nii.gz")
+
+    result = convert_case(
+        vol_path,
+        mask_path,
+        csv_row,
+        out_image,
+        out_label,
+        target_spacing_mm=TARGET_SPACING_MM,
+    )
+
+    # --- 1. spacing_written in summary must be target, not canonical ---
+    assert result["spacing_written"] == TARGET_SPACING_MM, (
+        f"convert_case summary 'spacing_written' must equal target_spacing_mm={TARGET_SPACING_MM}, "
+        f"got {result['spacing_written']}. "
+        "After D01.7, the written spacing is the target spacing, not CANONICAL_SPACING_MM."
+    )
+
+    # --- 2. NIfTI pixdim must match target_spacing_mm within 1e-6 ---
+    img = sitk.ReadImage(out_image)
+    sp = img.GetSpacing()  # (x, y, z) = (d2, d1, d0) in SimpleITK convention
+    actual_storage = (sp[2], sp[1], sp[0])  # -> (d0, d1, d2)
+
+    # Negative assertion: CANONICAL_SPACING_MM must NOT be what was written.
+    assert actual_storage != CANONICAL_SPACING_MM, (
+        f"NIfTI pixdim equals CANONICAL_SPACING_MM {CANONICAL_SPACING_MM} — "
+        "convert_case must write TARGET_SPACING_MM, not CANONICAL_SPACING_MM, after D01.7."
+    )
+
+    spacing_atol = 1e-6
+    for i, expected_sp in enumerate(TARGET_SPACING_MM):
+        actual_sp = actual_storage[i]
+        assert abs(actual_sp - expected_sp) < spacing_atol, (
+            f"NIfTI pixdim axis {i}: expected target spacing {expected_sp:.9f} mm, "
+            f"got {actual_sp:.9f} mm (diff={abs(actual_sp - expected_sp):.2e}). "
+            "convert_case must write target_spacing_mm into the NIfTI header after D01.7."
+        )
+
+    # --- 3. Written shape must match round(native_shape * native/target) element-wise ---
+    written_shape = img.GetSize()  # (x, y, z) = (d2, d1, d0) in SimpleITK
+    written_shape_storage = (written_shape[2], written_shape[1], written_shape[0])  # (d0,d1,d2)
+    for i in range(3):
+        expected_size = round(native_shape[i] * CANONICAL_SPACING_MM[i] / TARGET_SPACING_MM[i])
+        assert written_shape_storage[i] == expected_size, (
+            f"Written shape axis {i}: expected {expected_size} "
+            f"(= round({native_shape[i]} * {CANONICAL_SPACING_MM[i]} / {TARGET_SPACING_MM[i]})), "
+            f"got {written_shape_storage[i]}. "
+            "The resampled shape must equal round(native_shape * native_spacing / target_spacing)."
+        )
+
+
+# ===========================================================================
+# Test 27 — D01.7 resampling: nearest-neighbour mask resampling preserves
+#            lesion extent within 1 voxel (at the target spacing)
+#
+# NEW (D01.7, 2026-05-25): a synthetic binary mask with a known bbox extent on
+# the original grid is resampled by convert_case (nearest-neighbour) and the
+# post-resample bbox extent agrees with round(extent * native/target) within
+# 1 voxel per axis.
+#
+# TDD evidence: WRITTEN BEFORE implementation. Fails because convert_case does
+# not yet resample the mask.
+# ===========================================================================
+
+
+def test_resample_preserves_lesion_extent_within_1vx(tmp_path: Path) -> None:
+    """Nearest-neighbour mask resample preserves lesion extent within 1 voxel per axis.
+
+    ASC-01_01.5 sub-note (D01.7): for a synthetic binary mask with a lesion of known
+    bbox extent (native_extent_d0, native_extent_d1, native_extent_d2) voxels, after
+    resampling to target_spacing_mm via nearest-neighbour interpolation, the extent of
+    the foreground region (measured in voxels at the target spacing) must satisfy:
+
+        |actual_extent_i - round(native_extent_i * native_spacing_i / target_spacing_i)|
+        <= 1   for each axis i in {0, 1, 2}
+
+    This guards against catastrophic mask collapse (lesion shrinks to 0 voxels) or
+    gross expansion at the resample step.
+    """
+    case_id = 77
+    # Use a larger shape so the lesion has enough voxels for a meaningful test
+    vol_shape = (30, 40, 50)
+    # Lesion bbox in native voxels: extent = (8, 10, 12)
+    lesion_min = (5, 8, 10)
+    lesion_max = (12, 17, 21)  # inclusive max -> extent = (7, 9, 11)
+    native_lesion_box = BBox(
+        min_d0=lesion_min[0],
+        min_d1=lesion_min[1],
+        min_d2=lesion_min[2],
+        max_d0=lesion_max[0],
+        max_d1=lesion_max[1],
+        max_d2=lesion_max[2],
+    )
+    native_extent = (
+        lesion_max[0] - lesion_min[0] + 1,  # inclusive extent in voxels
+        lesion_max[1] - lesion_min[1] + 1,
+        lesion_max[2] - lesion_min[2] + 1,
+    )
+
+    vol_path = str(tmp_path / "DATA_0077.nrrd")
+    mask_path = str(tmp_path / "MASK_0077.nrrd")
+    _write_identity_volume_nrrd(vol_path, shape=vol_shape)
+    _write_identity_mask_nrrd(mask_path, shape=vol_shape, lesion_box=native_lesion_box)
+
+    csv_row = _make_csv_row(case_id, native_lesion_box)
+
+    out_image = str(tmp_path / "image_0077_0000.nii.gz")
+    out_label = str(tmp_path / "label_0077.nii.gz")
+
+    convert_case(
+        vol_path,
+        mask_path,
+        csv_row,
+        out_image,
+        out_label,
+        target_spacing_mm=TARGET_SPACING_MM,
+    )
+
+    # Read back the resampled mask and compute foreground bbox extent
+    label_img = sitk.ReadImage(out_label)
+    # sitk.GetArrayFromImage reverses SimpleITK (x,y,z)=(d2,d1,d0) to numpy (d0,d1,d2)
+    label_arr = sitk.GetArrayFromImage(label_img)  # shape (d0, d1, d2)
+
+    assert label_arr.max() > 0, (
+        "Resampled label is entirely zero — catastrophic mask collapse at resample step. "
+        f"Native lesion box: {native_lesion_box}. "
+        "Nearest-neighbour interpolation must preserve non-zero mask voxels."
+    )
+
+    # Find the foreground bounding box in the resampled mask
+    fg = np.where(label_arr > 0)
+    resampled_extent = (
+        int(fg[0].max() - fg[0].min() + 1),  # d0
+        int(fg[1].max() - fg[1].min() + 1),  # d1
+        int(fg[2].max() - fg[2].min() + 1),  # d2
+    )
+
+    # Expected extent at target spacing: round(native_extent * native/target)
+    expected_extent = tuple(
+        round(native_extent[i] * CANONICAL_SPACING_MM[i] / TARGET_SPACING_MM[i]) for i in range(3)
+    )
+
+    tolerance_vx = 1  # ≤ 1 voxel at target spacing per axis (ASC-01_01.5 sub-note)
+    for i in range(3):
+        deviation = abs(resampled_extent[i] - expected_extent[i])
+        assert deviation <= tolerance_vx, (
+            f"Resampled lesion extent on axis {i}: got {resampled_extent[i]} voxels, "
+            f"expected {expected_extent[i]} (= round({native_extent[i]} * "
+            f"{CANONICAL_SPACING_MM[i]} / {TARGET_SPACING_MM[i]})), "
+            f"deviation={deviation} voxels > tolerance={tolerance_vx}. "
+            "Nearest-neighbour mask resample must preserve lesion extent within 1 voxel."
+        )

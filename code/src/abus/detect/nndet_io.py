@@ -108,7 +108,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -182,6 +182,15 @@ class NndetDatasetSpec:
     spacing_mm:
         Canonical physical voxel spacing in storage-axis order (d0, d1, d2), mm.
         Always ``CANONICAL_SPACING_MM = (0.073, 0.200, 0.475674)``.
+        This is the native spacing injected at the I/O boundary by load_volume.
+    target_spacing_mm:
+        Post-resample target spacing written to the nnDetection .nii.gz files
+        (storage-axis order, mm). Decision D01.7 (2026-05-25): (0.3, 0.3, 0.5) mm.
+        nndet_prep's data fingerprint sees this as "native" spacing.
+    resample_image_interp:
+        SimpleITK interpolation for the image volume: ``"linear"`` → sitkLinear.
+    resample_mask_interp:
+        SimpleITK interpolation for the binary mask: ``"nearest"`` → sitkNearestNeighbor.
     modality:
         nnDetection modality string. ``"US"`` for B-mode ultrasound.
     label_semantics:
@@ -194,6 +203,9 @@ class NndetDatasetSpec:
     n_val_cases: int
     n_test_cases: int
     spacing_mm: tuple[float, float, float]
+    target_spacing_mm: tuple[float, float, float]
+    resample_image_interp: str
+    resample_mask_interp: str
     modality: str
     label_semantics: str
 
@@ -249,6 +261,77 @@ def _write_volume_nifti(
     # sitk spacing is (x, y, z) = (d2, d1, d0) in our storage-axis convention
     img.SetSpacing((float(spacing_mm[2]), float(spacing_mm[1]), float(spacing_mm[0])))
     sitk.WriteImage(img, path)
+
+
+def _resample_sitk_image(
+    sitk_image: sitk.Image,
+    target_spacing_mm: tuple[float, float, float],
+    interpolator: int,
+) -> sitk.Image:
+    """Resample a SimpleITK image to ``target_spacing_mm`` using ``interpolator``.
+
+    The input image must already have its spacing set to the correct physical spacing.
+    In ``convert_case``, this is done via ``sitk.GetImageFromArray`` +
+    ``SetSpacing(CANONICAL_SPACING_MM)`` immediately before calling this function
+    (the EPIC_00 loader injects CANONICAL_SPACING_MM at the I/O boundary; the caller
+    then sets it in the SimpleITK image object before resampling).
+
+    SimpleITK axis convention: the image's internal spacing is (x, y, z) = (d2, d1, d0)
+    in our storage-axis convention (the same convention used in ``_write_volume_nifti``).
+    ``target_spacing_mm`` is in storage-axis order (d0, d1, d2); this function converts it
+    to SimpleITK order (d2, d1, d0) before calling ResampleImageFilter.
+
+    The output size for each axis i is:
+        new_size_i = round(old_size_i * old_spacing_i / target_spacing_i)
+
+    Parameters
+    ----------
+    sitk_image:
+        SimpleITK image with correct spacing already set in its header.
+    target_spacing_mm:
+        Target physical spacing in storage-axis order (d0, d1, d2), mm.
+        Decision D01.7 (2026-05-25): (0.3, 0.3, 0.5).
+    interpolator:
+        SimpleITK interpolator constant (e.g. ``sitk.sitkLinear`` or
+        ``sitk.sitkNearestNeighbor``).
+
+    Returns
+    -------
+    sitk.Image
+        Resampled image with ``target_spacing_mm`` in its header.
+    """
+    # Guard: zero or negative spacing would produce ZeroDivisionError / inf in the
+    # size computation, with a cryptic SimpleITK error message downstream.
+    if any(s <= 0 for s in target_spacing_mm):
+        raise ValueError(
+            f"target_spacing_mm must be strictly positive on every axis; got {target_spacing_mm}"
+        )
+
+    orig_spacing_sitk = sitk_image.GetSpacing()  # (x, y, z) = (d2, d1, d0)
+    orig_size_sitk = sitk_image.GetSize()  # (x, y, z) = (d2, d1, d0)
+
+    # Convert target_spacing_mm (d0, d1, d2) -> SimpleITK (x=d2, y=d1, z=d0)
+    target_spacing_sitk = (
+        float(target_spacing_mm[2]),  # x = d2
+        float(target_spacing_mm[1]),  # y = d1
+        float(target_spacing_mm[0]),  # z = d0
+    )
+
+    # Compute output size per axis: round(old_size * old_spacing / target_spacing)
+    new_size_sitk = tuple(
+        max(1, round(orig_size_sitk[i] * orig_spacing_sitk[i] / target_spacing_sitk[i]))
+        for i in range(3)
+    )
+
+    resample = sitk.ResampleImageFilter()
+    resample.SetOutputSpacing(target_spacing_sitk)
+    resample.SetSize(new_size_sitk)
+    resample.SetOutputDirection(sitk_image.GetDirection())
+    resample.SetOutputOrigin(sitk_image.GetOrigin())
+    resample.SetTransform(sitk.Transform())
+    resample.SetDefaultPixelValue(0)
+    resample.SetInterpolator(interpolator)
+    return cast(sitk.Image, resample.Execute(sitk_image))
 
 
 def _write_per_case_json(label_nii_path: str) -> None:
@@ -312,6 +395,7 @@ def convert_case(
     bbox_csv_row: dict | list,
     out_image_path: str,
     out_label_path: str,
+    target_spacing_mm: tuple[float, float, float] = (0.3, 0.3, 0.5),
 ) -> dict:
     """Convert one TDSC case to nnDetection format.
 
@@ -322,15 +406,22 @@ def convert_case(
        non-placeholder header).
     2. Load the mask via load_mask (same guard).
     3. Assert the pair is consistent via assert_paired.
-    4. Write the volume with CANONICAL_SPACING_MM in the nnDetection image file.
-    5. Write the binary mask as the nnDetection label file, then write the
-       per-case instance JSON sidecar required by nnDetection v0.1 load.py
-       (``{"instances": {"1": 0}}``, single-lesion encoding only).
-    6. Compute the lesion count from the CSV row (1 row = 1 lesion in the
+    4. Build SimpleITK images with CANONICAL_SPACING_MM from the loaded arrays
+       (the I/O-boundary spacing injection step).
+    5. Resample the volume to ``target_spacing_mm`` using SimpleITK linear
+       interpolation (D01.7, 2026-05-25: default (0.3, 0.3, 0.5) mm).
+    6. Resample the binary mask to ``target_spacing_mm`` using SimpleITK
+       nearest-neighbour interpolation (preserves binary {0,1} values).
+    7. Write the resampled volume as .nii.gz with ``target_spacing_mm`` in the
+       NIfTI header (the spacing nndet_prep's fingerprint will see as "native").
+    8. Write the resampled binary mask as the nnDetection label file (.nii.gz),
+       then write the per-case instance JSON sidecar required by nnDetection
+       v0.1 load.py (``{"instances": {"1": 0}}``, single-lesion encoding only).
+    9. Compute the lesion count from the CSV row (1 row = 1 lesion in the
        single-lesion convention used by TDSC-ABUS-2023; multi-lesion cases have
        multiple CSV rows with the same id, and the caller is responsible for
        grouping and passing one row per call or all rows per case).
-    7. Return a per-case conversion summary dict.
+    10. Return a per-case conversion summary dict.
 
     Parameters
     ----------
@@ -348,12 +439,19 @@ def convert_case(
         Destination for the nnDetection image file (with correct spacing).
     out_label_path:
         Destination for the nnDetection label file (binary mask).
+    target_spacing_mm:
+        Target physical spacing to resample to before writing, in storage-axis
+        order (d0, d1, d2), mm. Default ``(0.3, 0.3, 0.5)`` per architect
+        decision D01.7 (2026-05-25) — fixes the c002 architecture-planner
+        convergence failure on native ABUS spacing. The written .nii.gz NIfTI
+        pixdim will equal this value; nndet_prep will see it as "native".
 
     Returns
     -------
     dict with keys:
         ``case_id`` (int), ``out_image_path`` (str), ``out_label_path`` (str),
-        ``n_lesions`` (int), ``spacing_written`` (tuple[float,float,float]).
+        ``n_lesions`` (int), ``spacing_written`` (tuple[float,float,float]),
+        ``shape_written`` (tuple[int,int,int]).
 
     Raises
     ------
@@ -371,11 +469,31 @@ def convert_case(
     Path(out_image_path).parent.mkdir(parents=True, exist_ok=True)
     Path(out_label_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Write image as .nii.gz with CANONICAL_SPACING_MM in the NIfTI header
-    _write_volume_nifti(out_image_path, vol_rec.array, CANONICAL_SPACING_MM)
+    # Build SimpleITK images with CANONICAL_SPACING_MM (I/O-boundary injection).
+    # sitk spacing is (x, y, z) = (d2, d1, d0) in our storage-axis convention.
+    sitk_spacing = (
+        float(CANONICAL_SPACING_MM[2]),
+        float(CANONICAL_SPACING_MM[1]),
+        float(CANONICAL_SPACING_MM[0]),
+    )
 
-    # Write label as .nii.gz (binary mask, same spacing)
-    _write_volume_nifti(out_label_path, mask_rec.array, CANONICAL_SPACING_MM)
+    sitk_vol = sitk.GetImageFromArray(vol_rec.array.astype(np.uint8))
+    sitk_vol.SetSpacing(sitk_spacing)
+
+    sitk_mask = sitk.GetImageFromArray(mask_rec.array.astype(np.uint8))
+    sitk_mask.SetSpacing(sitk_spacing)
+
+    # Resample to target_spacing_mm (D01.7): linear for image, NN for mask.
+    sitk_vol_resampled = _resample_sitk_image(sitk_vol, target_spacing_mm, sitk.sitkLinear)
+    sitk_mask_resampled = _resample_sitk_image(
+        sitk_mask, target_spacing_mm, sitk.sitkNearestNeighbor
+    )
+
+    # Write resampled image as .nii.gz with target_spacing_mm in the NIfTI header.
+    sitk.WriteImage(sitk_vol_resampled, out_image_path)
+
+    # Write resampled binary mask as .nii.gz (same target spacing).
+    sitk.WriteImage(sitk_mask_resampled, out_label_path)
 
     # Validate the CSV row and count lesions.
     # A dict has n_lesions=1; a list of dicts has n_lesions=len(list).
@@ -427,12 +545,18 @@ def convert_case(
     # lesion-count guard above to avoid writing a semantically-wrong sidecar).
     _write_per_case_json(out_label_path)
 
+    # Report written shape in storage-axis order (d0, d1, d2).
+    # sitk.GetSize() returns (x, y, z) = (d2, d1, d0); reverse to (d0, d1, d2).
+    written_size_sitk = sitk_vol_resampled.GetSize()
+    shape_written = (written_size_sitk[2], written_size_sitk[1], written_size_sitk[0])
+
     return {
         "case_id": vol_rec.case_id,
         "out_image_path": str(out_image_path),
         "out_label_path": str(out_label_path),
         "n_lesions": n_lesions,
-        "spacing_written": CANONICAL_SPACING_MM,
+        "spacing_written": target_spacing_mm,
+        "shape_written": shape_written,
     }
 
 
@@ -743,13 +867,30 @@ def export_dataset(
             csv_arg: Any = rows[0] if len(rows) == 1 else rows
 
             if write_label and out_label is not None:
-                summary = convert_case(str(vol_nrrd), str(mask_nrrd), csv_arg, out_image, out_label)
+                summary = convert_case(
+                    str(vol_nrrd),
+                    str(mask_nrrd),
+                    csv_arg,
+                    out_image,
+                    out_label,
+                    target_spacing_mm=spec.target_spacing_mm,
+                )
                 total_lesions += summary["n_lesions"]
             else:
-                # Val/test: write image only (spacing injection), no label
+                # Val/test: write image only (resampled to target spacing), no label.
                 vol_rec = load_volume(str(vol_nrrd))
                 Path(out_image).parent.mkdir(parents=True, exist_ok=True)
-                _write_volume_nifti(out_image, vol_rec.array, CANONICAL_SPACING_MM)
+                sitk_spacing = (
+                    float(CANONICAL_SPACING_MM[2]),
+                    float(CANONICAL_SPACING_MM[1]),
+                    float(CANONICAL_SPACING_MM[0]),
+                )
+                sitk_vol = sitk.GetImageFromArray(vol_rec.array.astype(np.uint8))
+                sitk_vol.SetSpacing(sitk_spacing)
+                sitk_vol_resampled = _resample_sitk_image(
+                    sitk_vol, spec.target_spacing_mm, sitk.sitkLinear
+                )
+                sitk.WriteImage(sitk_vol_resampled, out_image)
                 # Count lesions for summary but don't write a label file
                 total_lesions += len(rows) if isinstance(rows, list) else 1
 
@@ -779,7 +920,7 @@ def export_dataset(
         "n_val": counts["n_val"],
         "n_test": counts["n_test"],
         "total_lesions": total_lesions,
-        "spacing_written": CANONICAL_SPACING_MM,
+        "spacing_written": spec.target_spacing_mm,
         "splits_file": splits_path,
     }
 
@@ -789,12 +930,16 @@ def export_dataset(
 # ---------------------------------------------------------------------------
 
 
-def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
+def verify_nndet_dataset(
+    nndet_dataset_root: str,
+    expected_spacing_mm: tuple[float, float, float] | None = None,
+) -> dict:
     """Post-conversion verification of the nnDetection Task directory.
 
     Checks:
-        1. Every nnDetection image in ``imagesTr/`` carries CANONICAL_SPACING_MM
-           in its ``space directions`` header (not identity 1 mm).
+        1. Every nnDetection image in ``imagesTr/`` carries ``expected_spacing_mm``
+           in its NIfTI pixdim header (not identity 1 mm and not an unexpected value).
+           Default: ``(0.3, 0.3, 0.5)`` mm — the D01.7 target spacing.
         2. The ``splits_final.json`` file equals the frozen 5-fold manifest
            case-for-case (ASC-01_01.3).
         3. The ``dataset.json`` is present and contains the required keys.
@@ -803,6 +948,11 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
     ----------
     nndet_dataset_root:
         Path to the nnDetection Task directory (e.g. ``Task001_TDSCABUS/``).
+    expected_spacing_mm:
+        Expected physical spacing in storage-axis order (d0, d1, d2), mm.
+        Defaults to ``(0.3, 0.3, 0.5)`` — the D01.7 target spacing written
+        by ``convert_case``.  Pass ``CANONICAL_SPACING_MM`` if verifying a
+        pre-D01.7 dataset (not recommended for new datasets).
 
     Returns
     -------
@@ -815,6 +965,9 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
     NndetDatasetError
         On any mismatch (spacing, splits faithfulness, missing files).
     """
+    if expected_spacing_mm is None:
+        # D01.7 default: target spacing is (0.3, 0.3, 0.5) mm.
+        expected_spacing_mm = (0.3, 0.3, 0.5)
     task_dir = Path(nndet_dataset_root)
 
     # --- Check dataset.json exists and has nnDetection v0.1 required keys ---
@@ -911,14 +1064,15 @@ def verify_nndet_dataset(nndet_dataset_root: str) -> dict:
             sp = img.GetSpacing()  # (x, y, z) = (d2, d1, d0)
             # Map back to storage-axis order (d0, d1, d2) for comparison
             actual_storage = (sp[2], sp[1], sp[0])
-            for i, expected_sp in enumerate(CANONICAL_SPACING_MM):
+            for i, exp_sp in enumerate(expected_spacing_mm):
                 actual_sp = actual_storage[i]
-                if abs(actual_sp - expected_sp) > spacing_atol:
+                if abs(actual_sp - exp_sp) > spacing_atol:
                     raise NndetDatasetError(
                         f"Spacing mismatch in {img_path.name}: "
-                        f"axis {i} got {actual_sp:.9f} mm, expected {expected_sp:.9f} mm "
-                        f"(diff={abs(actual_sp - expected_sp):.2e}, atol={spacing_atol:.2e}). "
-                        "nnDetection will resample on a wrong grid."
+                        f"axis {i} got {actual_sp:.9f} mm, expected {exp_sp:.9f} mm "
+                        f"(diff={abs(actual_sp - exp_sp):.2e}, atol={spacing_atol:.2e}). "
+                        "nnDetection will resample on a wrong grid. "
+                        f"Expected spacing (D01.7 target): {expected_spacing_mm}."
                     )
             n_images_checked += 1
 

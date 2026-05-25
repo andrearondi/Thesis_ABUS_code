@@ -91,6 +91,20 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Read and validate target_spacing_mm (D01.7: (0.3, 0.3, 0.5) mm)
+    if "target_spacing_mm" not in cfg:
+        log.error(
+            "Config missing 'target_spacing_mm'. "
+            "Add target_spacing_mm: [0.3, 0.3, 0.5] to nndet_dataset.yaml. "
+            "(Required by D01.7, 2026-05-25.)"
+        )
+        sys.exit(1)
+    cfg_target_spacing = tuple(float(x) for x in cfg["target_spacing_mm"])
+
+    resample_interp = cfg.get("resample_interpolation", {})
+    resample_image_interp = str(resample_interp.get("image", "linear"))
+    resample_mask_interp = str(resample_interp.get("mask", "nearest"))
+
     spec = NndetDatasetSpec(
         task_id=int(cfg["task_id"]),
         task_name=str(cfg["task_name"]),
@@ -98,6 +112,9 @@ def main() -> None:
         n_val_cases=int(cfg["n_val_cases"]),
         n_test_cases=int(cfg["n_test_cases"]),
         spacing_mm=cfg_spacing,  # type: ignore[arg-type]
+        target_spacing_mm=cfg_target_spacing,  # type: ignore[arg-type]
+        resample_image_interp=resample_image_interp,
+        resample_mask_interp=resample_mask_interp,
         modality=str(cfg["modality"]),
         label_semantics=str(cfg["label_semantics"]),
     )
@@ -105,11 +122,21 @@ def main() -> None:
     log.info("Task: %s (id=%d)", spec.task_name, spec.task_id)
     log.info("TDSC root: %s", args.tdsc_root)
     log.info("Output root: %s", args.out_root)
-    log.info("Spacing to write: %s mm", spec.spacing_mm)
+    log.info("Native spacing: %s mm", spec.spacing_mm)
+    log.info("Target spacing (D01.7): %s mm", spec.target_spacing_mm)
 
     if args.dry_run:
         log.info("--dry-run: config validated. No files written.")
-        print(json.dumps({"status": "dry-run-ok", "spec": spec.task_name}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "status": "dry-run-ok",
+                    "spec": spec.task_name,
+                    "target_spacing_mm": list(spec.target_spacing_mm),
+                },
+                indent=2,
+            )
+        )
         return
 
     result = export_dataset(
