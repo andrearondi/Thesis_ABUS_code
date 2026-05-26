@@ -41,8 +41,9 @@ The inverse (resampled -> original) is:
 
 For the bbox round-trip (ASC-01_01.4) these mappings are applied to the min and
 max corners of the box. Because the endpoints are floats after resampling, the
-round-trip residual is bounded by the rounding error of the resampling factor —
-in practice ≤ 1 voxel on the original grid, which is the acceptance gate.
+round-trip residual is bounded by the composed-rounding envelope
+``(target_i + orig_i) / 2`` mm per axis. See D01.8 in decisions_log.md for the
+full derivation.
 
 When ``target_spacing == orig_spacing`` (no resampling), both mappings are the
 identity and the round-trip is exact.
@@ -50,6 +51,7 @@ identity and the round-trip is exact.
 The empirical round-trip test on the real resampled grid is the server-side half
 of ASC-01_01.4 (runbook STORY_01_01). This module's ``bbox_original_roundtrip``
 implements the round-trip formula so the test can be run against any target spacing.
+``bbox_roundtrip_residuals`` wraps it and evaluates the two-clause D01.8 gate.
 """
 
 from __future__ import annotations
@@ -78,6 +80,15 @@ NNDET_BOX_EXCLUSIVE_MAX: bool = True
 
 This directly corresponds to the +1 / -1 transforms in abus.geometry.convert
 (bbox_to_nndet / nndet_to_bbox). Source: nndet/utils/boxes.py, nndet/io/load.py.
+"""
+
+D01_8_PRIMARY_MM: float = 0.5
+"""ASC-01_01.4 primary gate threshold (mm). Analytic envelope ceiling under
+D01.7 spacings (max_i((target_i + orig_i)/2) = 0.4878 mm, rounded up to one
+decimal). See decisions_log.md D01.8 for derivation.
+
+This constant is the single source of truth for the primary clause of the two-
+clause bbox round-trip gate (ASC-01_01.4 amended 2026-05-26, D01.8).
 """
 
 
@@ -177,3 +188,116 @@ def bbox_original_roundtrip(
     iz2 = max(iz2, iz1 + 1)
 
     return nndet_to_bbox((iy1, ix1, iy2, ix2, iz1, iz2))
+
+
+def bbox_roundtrip_residuals(
+    b: BBox,
+    target_spacing_mm: tuple[float, float, float],
+) -> dict:
+    """Compute per-endpoint round-trip residuals in both voxels and mm.
+
+    Calls ``bbox_original_roundtrip(b, target_spacing_mm)`` and returns a dict
+    with per-axis voxel and mm residuals, the analytic per-axis envelope derived
+    from the composed-rounding formula, and two gate booleans.  Used by
+    ``verify_nndet_dataset.py`` to evaluate ASC-01_01.4 (D01.8 gate).
+
+    The structural envelope is computed from ``CANONICAL_SPACING_MM`` and
+    ``target_spacing_mm`` inline via ``ceil((target_i + orig_i) / (2 * orig_i))``,
+    so a future re-resample re-derives the envelope automatically without touching
+    this code.  Only ``D01_8_PRIMARY_MM`` (the ceiling rounded to one decimal) is
+    a hard-coded module constant.
+
+    Parameters
+    ----------
+    b:
+        Project BBox in storage-axis order, inclusive-max.
+    target_spacing_mm:
+        nnDetection's target voxel spacing (d0, d1, d2) in mm.
+
+    Returns
+    -------
+    dict with keys:
+        "gt_bbox"                 : tuple — input bbox endpoints
+                                    (d0min, d1min, d2min, d0max, d1max, d2max)
+        "recovered_bbox"          : tuple — recovered endpoints after round-trip
+        "residuals_vx"            : tuple[int, int, int, int, int, int] —
+                                    |recovered - gt| per endpoint, original-grid voxels
+        "residuals_mm"            : tuple[float, ...] —
+                                    residuals_vx[i] * CANONICAL_SPACING_MM[axis_of(i)]
+        "max_residual_mm"         : float — max over all 6 endpoints
+        "envelope_vx_per_axis"    : tuple[int, int, int] —
+                                    analytic per-axis worst-case in voxels
+                                    (3, 2, 2) under D01.7 spacings
+        "envelope_mm_per_axis"    : tuple[float, float, float] —
+                                    analytic per-axis worst-case in mm
+                                    ((target + orig) / 2, element-wise)
+        "primary_gate_pass"       : bool — max_residual_mm <= D01_8_PRIMARY_MM
+        "structural_gate_pass"    : bool — per-axis residuals_vx within envelope
+        "gate_pass"               : bool — primary_gate_pass AND structural_gate_pass
+    """
+    import math
+
+    from abus.io.loader import CANONICAL_SPACING_MM as ORIG
+
+    recovered = bbox_original_roundtrip(b, target_spacing_mm)
+
+    # Per-endpoint voxel residuals (6 values: min/max for each of d0, d1, d2).
+    residuals_vx: tuple[int, int, int, int, int, int] = (
+        abs(recovered.min_d0 - b.min_d0),
+        abs(recovered.min_d1 - b.min_d1),
+        abs(recovered.min_d2 - b.min_d2),
+        abs(recovered.max_d0 - b.max_d0),
+        abs(recovered.max_d1 - b.max_d1),
+        abs(recovered.max_d2 - b.max_d2),
+    )
+
+    # Axis index for each of the 6 endpoints: (d0, d1, d2, d0, d1, d2)
+    _axis_of = (0, 1, 2, 0, 1, 2)
+
+    # Physical mm residuals: residual_vx * native_spacing_on_that_axis
+    residuals_mm: tuple[float, float, float, float, float, float] = tuple(  # type: ignore[assignment]
+        residuals_vx[i] * ORIG[_axis_of[i]] for i in range(6)
+    )
+
+    max_residual_mm: float = max(residuals_mm)
+
+    # Analytic per-axis envelope (mm): (target_i + orig_i) / 2 per axis.
+    # Derived from the composed-rounding formula: each of the two round() calls
+    # contributes at most half a voxel in its own grid; together they bound the
+    # round-trip residual by (target/2 + orig/2) mm per axis.
+    envelope_mm_per_axis: tuple[float, float, float] = (
+        (target_spacing_mm[0] + ORIG[0]) / 2.0,
+        (target_spacing_mm[1] + ORIG[1]) / 2.0,
+        (target_spacing_mm[2] + ORIG[2]) / 2.0,
+    )
+
+    # Structural envelope (original-grid voxels): ceil(envelope_mm_i / orig_spacing_i).
+    # Equivalently: ceil((target_i + orig_i) / (2 * orig_i)).
+    envelope_vx_per_axis: tuple[int, int, int] = (
+        math.ceil(envelope_mm_per_axis[0] / ORIG[0]),
+        math.ceil(envelope_mm_per_axis[1] / ORIG[1]),
+        math.ceil(envelope_mm_per_axis[2] / ORIG[2]),
+    )
+
+    primary_gate_pass: bool = max_residual_mm <= D01_8_PRIMARY_MM
+
+    # Structural gate: per-axis residuals_vx (max of min and max endpoint for each axis).
+    # axis 0 (d0): indices 0 and 3; axis 1 (d1): indices 1 and 4; axis 2 (d2): indices 2 and 5.
+    structural_gate_pass: bool = (
+        max(residuals_vx[0], residuals_vx[3]) <= envelope_vx_per_axis[0]
+        and max(residuals_vx[1], residuals_vx[4]) <= envelope_vx_per_axis[1]
+        and max(residuals_vx[2], residuals_vx[5]) <= envelope_vx_per_axis[2]
+    )
+
+    return {
+        "gt_bbox": b.as_tuple(),
+        "recovered_bbox": recovered.as_tuple(),
+        "residuals_vx": residuals_vx,
+        "residuals_mm": residuals_mm,
+        "max_residual_mm": max_residual_mm,
+        "envelope_vx_per_axis": envelope_vx_per_axis,
+        "envelope_mm_per_axis": envelope_mm_per_axis,
+        "primary_gate_pass": primary_gate_pass,
+        "structural_gate_pass": structural_gate_pass,
+        "gate_pass": primary_gate_pass and structural_gate_pass,
+    }
