@@ -1,0 +1,64 @@
+# configs/detect/training.yaml
+# Pinned training configuration for STORY_01_02.
+#
+# Source of truth for nnDetection fold-training parameters.
+# Do NOT edit after training has started without recording the change in
+# docs/decisions_log.md (reproducibility, agent_rules §12).
+#
+# Changes here invalidate previously trained checkpoints.
+
+# nnDetection Task identity (must match configs/detect/nndet_dataset.yaml)
+task_name: "Task001_TDSCABUS"
+task_id: 1
+
+# nnDetection architecture — default Retina U-Net (thesis §3.2.3, not tuned)
+architecture: "RetinaUNet000"
+
+# Training schedule — nnDetection default (pre-registered, not a free parameter)
+# No architecture or schedule modification (thesis §3.2.3).
+training_schedule: "nndet_default"
+
+# Early stopping: monitored metric (nnDetection default internal validation metric)
+early_stopping_metric: "val_metric"
+
+# Five fold ids (pre-registered 5-fold design, thesis §3.2.1, §3.2.6)
+fold_ids: [0, 1, 2, 3, 4]
+
+# Fold sequential training (user decision D01.5, 2026-05-18):
+# folds trained strictly sequentially on a single GPU, one at a time.
+fold_parallelism: "sequential"
+
+# Checkpoint output root (server path, from server_layout.md)
+# The actual path on the server is /home/maia-user/Andre/checkpoints/
+# Relative to det_models env var or passed explicitly to scripts.
+checkpoint_root: "/home/maia-user/Andre/checkpoints"
+
+# Checkpoint retention policy (user decision D01.5, 2026-05-18):
+# Keep only the best-metric and the final ("last") checkpoint per fold.
+# nnDetection's intermediate periodic checkpoints are pruned after each fold.
+checkpoint_retention:
+  keep_best: true
+  keep_last: true
+  prune_intermediate: true
+
+# nnDetection version and commit hash (for reproducibility, agent_rules §12)
+# Set at training time by scripts/train_all_folds.py.
+nndet_version: "v0.1"
+nndet_commit_hash: "97a58f3110b71caf1b4bcc1851e67cf11e987fc5"
+
+# Cost-checkpoint trigger (EPIC_01 risk #1, ASC-01_02.2):
+# If five-fold extrapolation > cost_trigger_gpu_hours, trigger the fallback ladder.
+# Measured after fold 0 completes; job is paused for the user's GO / FALLBACK decision.
+cost_trigger_gpu_hours: 1300
+
+# Intra-fold-0 cost probe (readiness-check red-team, D01.6):
+# Within the first training hours of fold 0, measure GPU-h per epoch and extrapolate
+# the five-fold total BEFORE fold 0 completes. The runbook includes an early
+# checkpoint for this. This is an additional probe before the fold-0-completion check.
+intra_fold0_probe_epoch: 5  # probe after this many epochs
+
+# Ensemble combination WBC IoU (provisional, val/test path only):
+# The project-wide WBC params are calibrated in STORY_01_03. This value is used
+# only for the provisional intermediate inspection in STORY_01_02. The val/test
+# ensemble combination is re-run in STORY_01_03 with the calibrated WBCParams.
+provisional_ensemble_wbc_iou: 0.5
