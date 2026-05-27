@@ -1,49 +1,50 @@
 #!/usr/bin/env python
-"""Server CLI: OOF + ensemble candidate generation (STORY_01_02).
+"""Server CLI: OOF + ensemble candidate generation (STORY_01_02, D01.9).
 
-Usage
------
-Generate all candidates (OOF train + ensemble val + ensemble test):
-    python scripts/generate_candidates.py \\
-        --nndet-dataset-root $NNDET_PREPROCESSED \\
-        --checkpoints-root /home/maia-user/Andre/checkpoints \\
-        --out-dir /home/maia-user/Andre/candidates/raw \\
-        --nndet-commit <hash>
+Drives two separate nnDetection inference paths:
 
-Generate only OOF candidates (train split):
-    python scripts/generate_candidates.py ... --splits train
+  OOF path (--splits train):
+    For each fold k in 0..4, calls predict_oof(k, oof_ids(k), ...) which
+    internally invokes nndet.inference.helper.predict_dir(case_ids=...).
+    This is the ONLY nnDetection call that bypasses the CLI — per-fold OOF
+    over a specified case_ids list has no CLI surface in nnDetection 0.1.
+    The leakage guard in generate_oof_candidates fires BEFORE inference.
 
-Generate only ensemble candidates (val + test splits):
-    python scripts/generate_candidates.py ... --splits val test
+  Ensemble path (--splits val test):
+    Step 1: nndet_consolidate Task001_TDSCABUS RetinaUNetV001_D3V001_3d
+    Step 2: nndet_predict Task001_TDSCABUS RetinaUNetV001_D3V001_3d -f -1
+      (consolidated 5-fold ensemble on raw_splitted/imagesTs/)
+    Step 3: parse_predictions_dir on the consolidated test_predictions/ dir.
+    Step 4 (FALLBACK): if consolidated metadata is insufficient for
+      source_detectors, fall back to per-fold predict_oof for all val/test
+      cases + ensemble_combine.
 
-After generation, run the provenance check on the laptop:
-    python -m abus.detect.candidates --provenance-check <out-dir>
+nnDetection 0.1 CLI surface (commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5):
+  nndet_train <TASK> -o exp.fold=N            (training; see train_all_folds.py)
+  nndet_consolidate <TASK> <MODEL>            (consolidate 5 folds)
+  nndet_predict <TASK> <MODEL> -f -1          (ensemble on imagesTs/)
+  nndet_predict <TASK> <MODEL> -f N           (single-fold on imagesTs/)
 
-And the lap-top variant:
-    pytest tests/test_candidates.py
-
-Required environment variables (or pass via CLI):
-    NNDET_PREPROCESSED   — nnDetection preprocessed Task directory
-    DET_MODELS           — path for nnDetection training artefacts (checkpoints)
-
-GPU note: this script calls nnDetection inference (GPU required). It is NOT run
-locally. The nnDetection inference CLI must be available in the active conda env.
+Env-var contract (lowercase — nnDetection reads these via os.environ):
+  det_data   — nnDetection dataset root (e.g. /home/maia-user/nndet_data)
+  det_models — nnDetection model output root (same value for our task)
+  Both MUST be exported before running this script.
 
 Leakage control (thesis §3.2.1, §3.2.6):
-  - OOF: fold-k detector is applied ONLY to oof_ids(k). The generate_oof_candidates
-    leakage guard raises if a train_ids case is passed (in-code enforcement).
-  - Ensemble: all five fold detectors are applied to val/test cases independently,
-    then ensemble_combine (union → WBC → score/embedding averaging) is applied.
-    No 6th all-data detector is used (provenance_check enforces this post-hoc).
+  OOF: fold-k detector is applied ONLY to oof_ids(k). The generate_oof_candidates
+    leakage guard raises ProvenanceError if a train_ids case is passed (ASC-01_02.7).
+  Ensemble: all five fold detectors applied to val/test cases independently,
+    then combined. No 6th all-data detector (provenance_check enforces this).
 
 Serialisation:
-  Each RawCandidateSet is saved as:
-    <out_dir>/<split>_candidates.npz   — arrays
-    <out_dir>/<split>_candidates.json  — metadata
+  <out_dir>/<split>_candidates.npz + <split>_candidates.json
 
-After generation, the provenance_check is run automatically and the summary
-table is printed (split | n_volumes | total_candidates | mean/vol | mean_score).
-The embedding_variance_gap is also printed (OOF vs val set).
+After generation, provenance_check is run and the summary table + embedding
+variance gap are printed. Pass --provenance-check <out_dir> to re-run the
+check on existing files (laptop-safe, no GPU needed).
+
+GPU note: this script calls nnDetection inference (GPU required). NOT run locally.
+The nnDetection conda env must be active and det_data/det_models env vars set.
 """
 
 from __future__ import annotations
@@ -51,262 +52,347 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 # Add src/ to path for local import when run from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from collections.abc import Callable
+
 from abus.data.split import load_split
 from abus.detect.candidates import (
     RawCandidate,
     RawCandidateSet,
     embedding_variance_gap,
-    generate_ensemble_candidates,
     generate_oof_candidates,
     provenance_check,
 )
+from abus.detect.ensemble import ensemble_combine
+from abus.detect.nndet_inference import RawDetections, parse_predictions_dir, predict_oof
 
 # ---------------------------------------------------------------------------
-# nnDetection inference wrapper
+# Constants
+# ---------------------------------------------------------------------------
+
+TASK_NAME = "Task001_TDSCABUS"
+EXP_ID = "RetinaUNetV001_D3V001_3d"
+NNDET_COMMIT = "97a58f3110b71caf1b4bcc1851e67cf11e987fc5"
+
+
+# ---------------------------------------------------------------------------
+# OOF inference function (per fold via predict_oof Python helper)
 # ---------------------------------------------------------------------------
 
 
 def _make_oof_inference_fn(
     fold: int,
-    ckpt_path: str,
-    nndet_dataset_root: str,
-    nndet_commit: str,
-):
-    """Return an inference callable for OOF generation.
+    task_dir: str,
+    model_dir: str,
+) -> Callable[[list[int]], list[RawCandidate]]:
+    """Return an inference callable for OOF generation using predict_oof.
 
-    On the server this wraps the nnDetection inference CLI (nndet predict).
-    The output is parsed to build RawCandidate objects.
-
-    The callable signature is: (case_ids: list[int]) -> list[RawCandidate].
+    The callable signature: (case_ids: list[int]) -> list[RawCandidate].
+    Internally calls predict_oof(fold, case_ids, task_dir, model_dir) which
+    uses nndet.inference.helper.predict_dir(case_ids=...).
     """
 
     def inference_fn(case_ids: list[int]) -> list[RawCandidate]:
-        """Run nnDetection inference for fold ``fold`` on ``case_ids``."""
-        import subprocess
-        import tempfile
+        """Run fold-``fold`` detector on ``case_ids`` via predict_oof."""
+        # predict_oof returns dict[int, RawDetections] keyed by case_id
+        raw_dets = predict_oof(
+            fold=fold,
+            case_ids=case_ids,
+            task_dir=task_dir,
+            model_dir=model_dir,
+        )
 
-        # Write a temporary case-list file for nnDetection
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            for cid in case_ids:
-                f.write(f"{cid:04d}\n")
-            case_list_path = f.name
-
-        try:
-            # nnDetection predict CLI:
-            # python -m nndet.entrypoints.predict <task> RetinaUNet000 --fold <fold>
-            # --checkpoint <ckpt> --output <out_dir> --case-ids <case_list>
-            with tempfile.TemporaryDirectory() as out_dir:
-                cmd = [
-                    "python",
-                    "-m",
-                    "nndet.entrypoints.predict",
-                    "Task001_TDSCABUS",
-                    "RetinaUNet000",
-                    "--fold",
-                    str(fold),
-                    "--checkpoint",
-                    ckpt_path,
-                    "--output",
-                    out_dir,
-                    "--case-ids",
-                    case_list_path,
-                ]
-                result = subprocess.run(
-                    cmd,
-                    cwd=nndet_dataset_root,
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"nnDetection inference failed for fold {fold}.\n"
-                        f"Command: {' '.join(cmd)}\n"
-                        f"Return code: {result.returncode}\n"
-                        f"stderr:\n{result.stderr[-3000:]}\n"
-                    )
-
-                # Parse nnDetection inference output files into RawCandidate objects.
-                # nnDetection writes per-case box+score+embedding files.
-                candidates = _parse_nndet_predictions(
-                    out_dir, case_ids, split="train", fold=fold, nndet_commit=nndet_commit
-                )
-        finally:
-            os.unlink(case_list_path)
-
-        return candidates
-
-    return inference_fn
-
-
-def _make_ensemble_inference_fn(
-    fold: int,
-    ckpt_path: str,
-    nndet_dataset_root: str,
-    nndet_commit: str,
-    split: str,
-):
-    """Return an inference callable for ensemble generation (one fold at a time)."""
-
-    def inference_fn(fold_id: int, case_ids: list[int]) -> list[RawCandidate]:
-        """Run nnDetection inference for one fold on all val/test cases."""
-        import subprocess
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as out_dir:
-            cmd = [
-                "python",
-                "-m",
-                "nndet.entrypoints.predict",
-                "Task001_TDSCABUS",
-                "RetinaUNet000",
-                "--fold",
-                str(fold_id),
-                "--checkpoint",
-                ckpt_path,
-                "--output",
-                out_dir,
-                "--split",
-                split,
-            ]
-            result = subprocess.run(
-                cmd,
-                cwd=nndet_dataset_root,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"nnDetection inference failed for fold {fold_id}.\n"
-                    f"Command: {' '.join(cmd)}\n"
-                    f"Return code: {result.returncode}\n"
-                    f"stderr:\n{result.stderr[-3000:]}\n"
-                )
-
-            candidates = _parse_nndet_predictions(
-                out_dir, case_ids, split=split, fold=fold_id, nndet_commit=nndet_commit
+        candidates: list[RawCandidate] = []
+        for _case_id, rd in raw_dets.items():
+            candidates.extend(
+                _raw_detections_to_candidates(rd, split="train", source_detectors=(fold,))
             )
         return candidates
 
     return inference_fn
 
 
-def _parse_nndet_predictions(
-    out_dir: str,
-    case_ids: list[int],
+# ---------------------------------------------------------------------------
+# Ensemble inference functions (nndet_consolidate + nndet_predict -f -1)
+# ---------------------------------------------------------------------------
+
+
+def _run_consolidate(task_name: str, exp_id: str) -> None:
+    """Run nndet_consolidate to create the 5-fold ensemble metadata.
+
+    CLI: nndet_consolidate <TASK> <MODEL>
+    """
+    cmd = ["nndet_consolidate", task_name, exp_id]
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(  # noqa: S603
+        cmd,
+        capture_output=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"nndet_consolidate failed.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Return code: {result.returncode}\n"
+        )
+    print("  nndet_consolidate complete.")
+
+
+def _run_ensemble_predict(task_name: str, exp_id: str) -> None:
+    """Run nndet_predict with -f -1 (all-folds ensemble on imagesTs/).
+
+    CLI: nndet_predict <TASK> <MODEL> -f -1
+    Output lands at $det_models/<TASK>/<EXP_ID>/test_predictions/
+    """
+    cmd = ["nndet_predict", task_name, exp_id, "-f", "-1"]
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(  # noqa: S603
+        cmd,
+        capture_output=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"nndet_predict -f -1 failed.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Return code: {result.returncode}\n"
+        )
+    print("  nndet_predict (ensemble) complete.")
+
+
+# ---------------------------------------------------------------------------
+# Convert RawDetections → RawCandidate list
+# ---------------------------------------------------------------------------
+
+
+def _raw_detections_to_candidates(
+    rd: RawDetections,
     split: str,
-    fold: int,
-    nndet_commit: str,
+    source_detectors: tuple[int, ...],
+    embedding_dim: int = 1,
 ) -> list[RawCandidate]:
-    """Parse nnDetection prediction output files into RawCandidate objects.
+    """Convert a RawDetections record to a list of RawCandidate objects.
 
-    nnDetection writes per-case JSON or pickle files with boxes, scores, and
-    (optionally) backbone embeddings. This function reads them and constructs
-    RawCandidate objects.
+    Boxes are left in nnDetection's resampled-grid convention here. The
+    grid→original conversion (using nndet_convention.py) is deferred to
+    STORY_01_04 which wires the full feature-extraction pipeline.
 
-    The exact output format depends on the nnDetection version. This implementation
-    reads the standard nnDetection v0.1 prediction output format:
-      <out_dir>/<case_id_4d>_boxes.npy   — (N, 6) float array (y1,x1,y2,x2,z1,z2)
-      <out_dir>/<case_id_4d>_scores.npy  — (N,) float array
-      <out_dir>/<case_id_4d>_emb.npy     — (N, D) float32 array (optional)
+    STORY_01_02's goal is to produce the raw candidate set with correct
+    provenance; the exact box coordinates on the original grid are verified
+    by STORY_01_01's round-trip test and STORY_01_04's bbox extraction.
 
-    If embedding files are absent, a zero vector of shape (1,) is used as a
-    placeholder (embedding extraction may be a separate post-processing step).
+    If rd.embeddings is None (not available in nnDetection 0.1's output),
+    a zero-vector placeholder of shape (1,) is used until STORY_01_04 wires
+    the backbone-pooled embedding extraction (story spec note on placeholder).
     """
     import numpy as np
 
-    from abus.geometry.convert import nndet_to_bbox
+    from abus.geometry.bbox import BBox
 
     candidates: list[RawCandidate] = []
-    out_path = Path(out_dir)
 
-    # Discover case ids from output files if case_ids is empty
-    if not case_ids:
-        box_files = sorted(out_path.glob("*_boxes.npy"))
-        file_case_ids = []
-        for bf in box_files:
-            stem = bf.stem.replace("_boxes", "")
-            try:
-                file_case_ids.append(int(stem))
-            except ValueError:
-                pass
-        case_ids = file_case_ids
+    if rd.boxes.shape[0] == 0:
+        return candidates
 
-    target_spacing = (0.3, 0.3, 0.5)  # D01.7 target spacing
+    for i in range(rd.boxes.shape[0]):
+        # Boxes in nnDetection 0.1 format: (z1, y1, x1, z2, y2, x2) on resampled grid.
+        # [SERVER-SIDE AUDIT: confirm axis order against nnDetection 0.1 source
+        #  before first server run. See nndet_inference.py schema note.]
+        box = rd.boxes[i]
+        z1, y1, x1, z2, y2, x2 = (int(round(float(v))) for v in box)
 
-    for case_id in case_ids:
-        boxes_file = out_path / f"{case_id:04d}_boxes.npy"
-        scores_file = out_path / f"{case_id:04d}_scores.npy"
-        emb_file = out_path / f"{case_id:04d}_emb.npy"
+        # Map to project BBox convention:
+        # project BBox: (min_d0, min_d1, min_d2, max_d0, max_d1, max_d2)
+        # nnDetection grid: z~d0, y~d1, x~d2 (to be confirmed by server audit)
+        # Use conservative inclusive-max by ensuring max > min.
+        bbox = BBox(
+            min_d0=z1,
+            min_d1=y1,
+            min_d2=x1,
+            max_d0=max(z2, z1 + 1),
+            max_d1=max(y2, y1 + 1),
+            max_d2=max(x2, x1 + 1),
+        )
 
-        if not boxes_file.exists() or not scores_file.exists():
-            # No predictions for this case — skip (valid: no detections)
-            continue
-
-        boxes = np.load(str(boxes_file))  # (N, 6) — nndet (y1,x1,y2,x2,z1,z2) resampled
-        scores = np.load(str(scores_file))  # (N,)
-
-        if emb_file.exists():
-            embs = np.load(str(emb_file)).astype(np.float32)  # (N, D)
+        if rd.embeddings is not None:
+            emb = rd.embeddings[i].astype(np.float32)
         else:
-            # Placeholder embedding (D=1) until embedding extraction is implemented
-            embs = np.zeros((len(scores), 1), dtype=np.float32)
+            emb = np.zeros(embedding_dim, dtype=np.float32)
 
-        for i in range(len(scores)):
-            # Convert resampled-grid nndet box back to original-grid project BBox.
-            # nndet box: (y1, x1, y2, x2, z1, z2) exclusive max, resampled grid.
-            # Step 1: convert to original grid via the spacing ratio.
-            y1, x1, y2, x2, z1, z2 = (int(v) for v in boxes[i])
-            # Scale back to original grid (resampled -> original)
-            # orig_coord = resamp_coord * (target_spacing / orig_spacing)
-            from abus.io.loader import CANONICAL_SPACING_MM as ORIG
-
-            def _back(coord: int, axis: int) -> int:
-                return round(coord * target_spacing[axis] / ORIG[axis])
-
-            # d0->y, d1->x, d2->z
-            oy1 = _back(y1, 0)
-            ox1 = _back(x1, 1)
-            oy2 = _back(y2, 0)
-            ox2 = _back(x2, 1)
-            oz1 = _back(z1, 2)
-            oz2 = _back(z2, 2)
-
-            # Ensure valid inclusive-max BBox (exclusive -> inclusive for nndet_to_bbox)
-            oy2 = max(oy2, oy1 + 1)
-            ox2 = max(ox2, ox1 + 1)
-            oz2 = max(oz2, oz1 + 1)
-
-            bbox = nndet_to_bbox((oy1, ox1, oy2, ox2, oz1, oz2))
-
-            candidates.append(
-                RawCandidate(
-                    case_id=case_id,
-                    split=split,
-                    bbox=bbox,
-                    score=float(scores[i]),
-                    embedding=embs[i].astype(np.float32),
-                    source_detectors=(fold,),
-                )
+        candidates.append(
+            RawCandidate(
+                case_id=rd.case_id,
+                split=split,
+                bbox=bbox,
+                score=float(rd.scores[i]),
+                embedding=emb,
+                source_detectors=source_detectors,
             )
+        )
 
     return candidates
 
 
 # ---------------------------------------------------------------------------
-# Summary table
+# Ensemble path: branch (a) — consolidated nndet_predict -f -1
 # ---------------------------------------------------------------------------
 
 
-def _print_summary_table(
-    split: str,
-    cset: RawCandidateSet,
-) -> None:
+def _generate_ensemble_branch_a(
+    det_models_root: str,
+    task_name: str,
+    exp_id: str,
+    split_case_ids: dict[str, list[int]],
+    nndet_commit: str,
+) -> dict[str, RawCandidateSet]:
+    """Consolidated nndet_predict -f -1 path.
+
+    Runs consolidate + ensemble predict, parses the output, assigns
+    source_detectors from the consolidated output.
+
+    NOTE: nnDetection 0.1's consolidated output may or may not carry per-cluster
+    fold-contribution metadata. If it does, source_detectors is populated from
+    that metadata. If not, the consolidated output treats all 5 folds as a unit
+    and source_detectors is set to (0,1,2,3,4) for every candidate.
+
+    [SERVER-SIDE AUDIT REQUIRED: verify whether nnDetection 0.1's consolidated
+    test_predictions/<case>_boxes.pkl includes per-cluster fold-membership info.
+    If it does, update the source_detectors assignment below accordingly.]
+    """
+    print("\nStep 1: nndet_consolidate ...")
+    _run_consolidate(task_name, exp_id)
+
+    print("\nStep 2: nndet_predict -f -1 (ensemble) ...")
+    _run_ensemble_predict(task_name, exp_id)
+
+    # Consolidated predictions land at:
+    # $det_models/<task_name>/<exp_id>/test_predictions/
+    pred_dir = Path(det_models_root) / task_name / exp_id / "test_predictions"
+    print(f"\nStep 3: parsing predictions from {pred_dir} ...")
+    raw_dets = parse_predictions_dir(str(pred_dir))
+    print(f"  Parsed {len(raw_dets)} cases.")
+
+    # Assign source_detectors.
+    # [SERVER-SIDE AUDIT: if the consolidated output carries per-cluster fold
+    # metadata, parse it here. For now, conservatively assign all 5 folds since
+    # the consolidated ensemble uses all 5 fold detectors.]
+    all_source_detectors: tuple[int, ...] = (0, 1, 2, 3, 4)
+
+    result: dict[str, RawCandidateSet] = {}
+
+    for spl in ("val", "test"):
+        if spl not in split_case_ids:
+            continue
+        case_ids_for_split = set(split_case_ids[spl])
+        candidates: list[RawCandidate] = []
+
+        for case_id, rd in raw_dets.items():
+            if case_id not in case_ids_for_split:
+                continue
+            # Re-use the shared converter; all_source_detectors = (0,1,2,3,4) for
+            # the consolidated ensemble path (all 5 fold detectors contributed).
+            candidates.extend(
+                _raw_detections_to_candidates(rd, split=spl, source_detectors=all_source_detectors)
+            )
+
+        result[spl] = RawCandidateSet(
+            split=spl,
+            candidates=candidates,
+            detector_commit=nndet_commit,
+            _fold_of={},
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Ensemble path: branch (b) fallback — per-fold predict_oof + ensemble_combine
+# ---------------------------------------------------------------------------
+
+
+def _generate_ensemble_branch_b(
+    det_models_root: str,
+    task_name: str,
+    exp_id: str,
+    split_case_ids: dict[str, list[int]],
+    task_dir: str,
+    nndet_commit: str,
+) -> dict[str, RawCandidateSet]:
+    """Per-fold fallback: five predict_oof calls + ensemble_combine.
+
+    Used when branch (a) cannot assign per-cluster source_detectors reliably,
+    OR when the consolidated output is unavailable.
+    """
+
+    # Collect per-case proposals from all 5 fold detectors
+    all_splits = list(split_case_ids.keys())
+    all_case_ids = sorted({cid for ids in split_case_ids.values() for cid in ids})
+
+    proposals_by_case: dict[int, list[RawCandidate]] = {cid: [] for cid in all_case_ids}
+
+    for fold in range(5):
+        model_dir = str(Path(det_models_root) / task_name / exp_id / f"fold{fold}")
+        print(f"  Fold {fold}: running predict_oof for {len(all_case_ids)} val/test cases ...")
+
+        raw_dets = predict_oof(
+            fold=fold,
+            case_ids=all_case_ids,
+            task_dir=task_dir,
+            model_dir=model_dir,
+        )
+
+        for case_id, rd in raw_dets.items():
+            fold_candidates = _raw_detections_to_candidates(
+                rd, split="ens_tmp", source_detectors=(fold,)
+            )
+            proposals_by_case.setdefault(case_id, []).extend(fold_candidates)
+
+    result: dict[str, RawCandidateSet] = {}
+
+    for spl in all_splits:
+        case_ids_for_split = set(split_case_ids[spl])
+        combined: list[RawCandidate] = []
+
+        for case_id in sorted(case_ids_for_split):
+            props = proposals_by_case.get(case_id, [])
+            if not props:
+                continue
+            # Re-tag split
+            retagged = [
+                RawCandidate(
+                    case_id=p.case_id,
+                    split=spl,
+                    bbox=p.bbox,
+                    score=p.score,
+                    embedding=p.embedding,
+                    source_detectors=p.source_detectors,
+                )
+                for p in props
+            ]
+            combined.extend(ensemble_combine(retagged, iou_threshold=0.5))
+
+        result[spl] = RawCandidateSet(
+            split=spl,
+            candidates=combined,
+            detector_commit=nndet_commit,
+            _fold_of={},
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Summary table + helpers
+# ---------------------------------------------------------------------------
+
+
+def _print_summary_table(split: str, cset: RawCandidateSet) -> None:
     """Print the candidate summary table for one split."""
     import numpy as np
 
@@ -314,7 +400,6 @@ def _print_summary_table(
     total = len(cset.candidates)
     mean_per_vol = total / n_vols if n_vols > 0 else 0.0
     mean_score = float(np.mean([c.score for c in cset.candidates])) if cset.candidates else 0.0
-    # source_detector check
     unique_src = {s for c in cset.candidates for s in c.source_detectors}
     print(
         f"  {split:5s} | vols={n_vols:4d} | cands={total:6d} | "
@@ -330,17 +415,23 @@ def _print_summary_table(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate OOF + ensemble raw candidates (STORY_01_02).",
+        description="Generate OOF + ensemble raw candidates (STORY_01_02, D01.9).",
     )
     parser.add_argument(
-        "--nndet-dataset-root",
-        default=os.environ.get("NNDET_PREPROCESSED", ""),
-        help="nnDetection preprocessed Task directory (env: NNDET_PREPROCESSED).",
+        "--det-data",
+        default=os.environ.get("det_data", ""),
+        help=(
+            "nnDetection dataset root (env: det_data — lowercase). "
+            "Example: /home/maia-user/nndet_data"
+        ),
     )
     parser.add_argument(
-        "--checkpoints-root",
-        required=True,
-        help="Root directory containing fold checkpoints: <root>/fold_<k>/model_best.ckpt",
+        "--det-models",
+        default=os.environ.get("det_models", ""),
+        help=(
+            "nnDetection model output root (env: det_models — lowercase). "
+            "For our task: same as det_data."
+        ),
     )
     parser.add_argument(
         "--out-dir",
@@ -356,67 +447,94 @@ def main() -> None:
     )
     parser.add_argument(
         "--nndet-commit",
-        default="unknown",
+        default=NNDET_COMMIT,
         help="nnDetection commit hash (for reproducibility).",
     )
     parser.add_argument(
-        "--provisional-ensemble-iou",
-        type=float,
-        default=0.5,
+        "--ensemble-branch",
+        choices=["a", "b", "auto"],
+        default="auto",
         help=(
-            "Provisional WBC IoU for val/test ensemble combination (default 0.5). "
-            "Superseded by STORY_01_03 calibrated params; this value is only for "
-            "an intermediate inspection."
+            "Ensemble path for val/test: "
+            "'a' = consolidated nndet_predict -f -1 (preferred); "
+            "'b' = per-fold fallback via predict_oof + ensemble_combine; "
+            "'auto' = try branch (a), fall back to (b) on error (default)."
         ),
+    )
+    parser.add_argument(
+        "--provenance-check",
+        metavar="RAW_CANDIDATES_DIR",
+        help="Re-run provenance_check on existing candidate files in the given directory.",
     )
     args = parser.parse_args()
 
-    if not args.nndet_dataset_root:
-        parser.error("--nndet-dataset-root or $NNDET_PREPROCESSED must be set.")
+    # -- Provenance-check-only mode (laptop-safe)
+    if args.provenance_check:
+        from abus.detect.candidates import _cli_provenance_check
 
+        sys.exit(_cli_provenance_check(args.provenance_check))
+
+    if not args.det_data:
+        parser.error(
+            "--det-data or $det_data must be set (lowercase env var; "
+            "nnDetection silently ignores the uppercase DET_DATA)."
+        )
+    if not args.det_models:
+        parser.error("--det-models or $det_models must be set (lowercase env var).")
+
+    task_dir = str(Path(args.det_data) / TASK_NAME)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load the frozen 5-fold split for provenance
-    split = load_split()
-    fold_of: dict[int, int] = split.fold_of
+    # Load the frozen 5-fold split for provenance and case-id discovery
+    split_manifest = load_split()
 
-    # Build checkpoint paths
-    ckpt_root = Path(args.checkpoints_root)
-    ckpt_paths: dict[int, str] = {}
-    for fold_id in range(5):
-        ckpt = ckpt_root / f"fold_{fold_id}" / "model_best.ckpt"
-        if not ckpt.exists():
-            # Try alternative layout
-            ckpt = (
-                ckpt_root / "Task001_TDSCABUS" / "RetinaUNet000" / str(fold_id) / "model_best.ckpt"
-            )
-        if not ckpt.exists():
-            print(f"WARNING: checkpoint for fold {fold_id} not found at {ckpt}")
-        else:
-            ckpt_paths[fold_id] = str(ckpt)
+    # Build the case-id map for each split
+    # train = all 100 training cases (0..99 by convention)
+    train_ids = sorted(split_manifest.fold_of.keys())
+    # val/test are the 30 + 70 cases in raw_splitted/imagesTs/
+    # We discover them from the manifest if available; otherwise use known ranges.
+    # STORY_01_01 confirmed val = 100..129, test = 130..199.
+    val_ids = list(range(100, 130))
+    test_ids = list(range(130, 200))
+
+    split_case_ids: dict[str, list[int]] = {
+        "train": train_ids,
+        "val": val_ids,
+        "test": test_ids,
+    }
 
     candidate_sets: dict[str, RawCandidateSet] = {}
 
-    # --- OOF generation (train split) ---
+    # -----------------------------------------------------------------------
+    # OOF generation (train split)
+    # -----------------------------------------------------------------------
     if "train" in args.splits:
-        print("\nGenerating OOF candidates (train split)...")
+        print("\n=== OOF candidate generation (train split) ===")
         all_oof: list[RawCandidate] = []
+
         for fold_id in range(5):
-            if fold_id not in ckpt_paths:
-                print(f"  Skipping fold {fold_id} (checkpoint not found).")
-                continue
+            model_dir = str(Path(args.det_models) / TASK_NAME / EXP_ID / f"fold{fold_id}")
+            print(f"\nFold {fold_id}: {model_dir}")
+
+            oof_case_ids = split_manifest.oof_ids(fold_id)
+            print(f"  OOF case_ids: {len(oof_case_ids)} cases")
+
+            # The leakage guard in generate_oof_candidates fires BEFORE inference
+            # (ASC-01_02.7). It raises ProvenanceError if any case_ids are
+            # in train_ids(fold).
             inference_fn = _make_oof_inference_fn(
                 fold=fold_id,
-                ckpt_path=ckpt_paths[fold_id],
-                nndet_dataset_root=args.nndet_dataset_root,
-                nndet_commit=args.nndet_commit,
+                task_dir=task_dir,
+                model_dir=model_dir,
             )
+
             fold_candidates = generate_oof_candidates(
                 fold=fold_id,
-                detector_ckpt=ckpt_paths[fold_id],
-                nndet_dataset_root=args.nndet_dataset_root,
+                detector_ckpt=model_dir,
+                nndet_dataset_root=args.det_data,
                 inference_fn=inference_fn,
+                split_override=split_manifest,
             )
             print(f"  Fold {fold_id}: {len(fold_candidates)} OOF candidates.")
             all_oof.extend(fold_candidates)
@@ -425,51 +543,70 @@ def main() -> None:
             split="train",
             candidates=all_oof,
             detector_commit=args.nndet_commit,
-            _fold_of=dict(fold_of),
+            _fold_of=dict(split_manifest.fold_of),
         )
         path = str(out_dir / "train_candidates")
         train_set.save(path)
-        print(f"Saved train candidates: {path}.npz + .json")
+        print(f"\nSaved train candidates: {path}.npz + .json")
         candidate_sets["train"] = train_set
 
-    # --- Ensemble generation (val + test splits) ---
-    for spl in ("val", "test"):
-        if spl not in args.splits:
-            continue
-        print(f"\nGenerating ensemble candidates ({spl} split)...")
+    # -----------------------------------------------------------------------
+    # Ensemble generation (val + test splits)
+    # -----------------------------------------------------------------------
+    ens_splits = [s for s in ("val", "test") if s in args.splits]
+    if ens_splits:
+        print("\n=== Ensemble candidate generation (val + test splits) ===")
 
-        def ensemble_inference_fn(
-            fold_id: int, case_ids: list[int], _spl: str = spl
-        ) -> list[RawCandidate]:
-            if fold_id not in ckpt_paths:
-                return []
-            fn = _make_ensemble_inference_fn(
-                fold=fold_id,
-                ckpt_path=ckpt_paths[fold_id],
-                nndet_dataset_root=args.nndet_dataset_root,
+        requested_split_ids = {spl: split_case_ids[spl] for spl in ens_splits}
+
+        if args.ensemble_branch in ("a", "auto"):
+            try:
+                ens_sets = _generate_ensemble_branch_a(
+                    det_models_root=args.det_models,
+                    task_name=TASK_NAME,
+                    exp_id=EXP_ID,
+                    split_case_ids=requested_split_ids,
+                    nndet_commit=args.nndet_commit,
+                )
+                print("Ensemble branch (a): consolidated nndet_predict -f -1 complete.")
+            except Exception as exc:
+                if args.ensemble_branch == "auto":
+                    print(
+                        f"  WARNING: branch (a) failed ({exc}). "
+                        "Falling back to branch (b): per-fold predict_oof + ensemble_combine."
+                    )
+                    ens_sets = _generate_ensemble_branch_b(
+                        det_models_root=args.det_models,
+                        task_name=TASK_NAME,
+                        exp_id=EXP_ID,
+                        split_case_ids=requested_split_ids,
+                        task_dir=task_dir,
+                        nndet_commit=args.nndet_commit,
+                    )
+                    print("Ensemble branch (b) fallback complete.")
+                else:
+                    raise
+        else:
+            # --ensemble-branch b
+            ens_sets = _generate_ensemble_branch_b(
+                det_models_root=args.det_models,
+                task_name=TASK_NAME,
+                exp_id=EXP_ID,
+                split_case_ids=requested_split_ids,
+                task_dir=task_dir,
                 nndet_commit=args.nndet_commit,
-                split=_spl,
             )
-            return fn(fold_id, case_ids)
+            print("Ensemble branch (b) complete.")
 
-        ensemble_candidates = generate_ensemble_candidates(
-            split=spl,
-            detector_ckpts=ckpt_paths,
-            nndet_dataset_root=args.nndet_dataset_root,
-            inference_fn=ensemble_inference_fn,
-        )
-        ens_set = RawCandidateSet(
-            split=spl,
-            candidates=ensemble_candidates,
-            detector_commit=args.nndet_commit,
-            _fold_of={},  # val/test cases have no fold membership
-        )
-        path = str(out_dir / f"{spl}_candidates")
-        ens_set.save(path)
-        print(f"Saved {spl} candidates: {path}.npz + .json")
-        candidate_sets[spl] = ens_set
+        for spl, cset in ens_sets.items():
+            path = str(out_dir / f"{spl}_candidates")
+            cset.save(path)
+            print(f"Saved {spl} candidates: {path}.npz + .json")
+            candidate_sets[spl] = cset
 
-    # --- Provenance check ---
+    # -----------------------------------------------------------------------
+    # Provenance check
+    # -----------------------------------------------------------------------
     print("\n--- Provenance check ---")
     all_ok = True
     for spl, cset in candidate_sets.items():
@@ -483,13 +620,17 @@ def main() -> None:
     if all_ok:
         print("PROVENANCE OK")
 
-    # --- Candidate summary table ---
+    # -----------------------------------------------------------------------
+    # Candidate summary table
+    # -----------------------------------------------------------------------
     print("\n--- Candidate summary ---")
     print(f"  {'split':5s} | {'vols':>4s} | {'cands':>6s} | mean/vol | mean_score | src_folds")
     for spl, cset in candidate_sets.items():
         _print_summary_table(spl, cset)
 
-    # --- Embedding variance gap (OOF vs val) ---
+    # -----------------------------------------------------------------------
+    # Embedding variance gap (OOF vs val — D01.6 diagnostic)
+    # -----------------------------------------------------------------------
     if "train" in candidate_sets and "val" in candidate_sets:
         if candidate_sets["train"].candidates and candidate_sets["val"].candidates:
             print("\n--- OOF-vs-ensemble embedding-variance gap (D01.6) ---")
@@ -498,7 +639,6 @@ def main() -> None:
             print(f"  per_dim_oof_var mean:      {gap['per_dim_oof_var'].mean():.6f}")
             print(f"  per_dim_ensemble_var mean: {gap['per_dim_ensemble_var'].mean():.6f}")
 
-            # Save gap report
             gap_path = out_dir / "embedding_variance_gap.json"
             gap_report = {
                 "pooled_mean_ratio": float(gap["pooled_mean_ratio"]),

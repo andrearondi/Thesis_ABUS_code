@@ -27,9 +27,12 @@ from abus.detect.candidates import (
     RawCandidate,
     RawCandidateSet,
     embedding_variance_gap,
+    generate_ensemble_candidates,
     generate_oof_candidates,
     provenance_check,
 )
+
+# ASC-01_02.7: the leakage guard must raise ProvenanceError before inference is called.
 from abus.detect.ensemble import ensemble_combine
 from abus.geometry.bbox import BBox
 
@@ -305,7 +308,9 @@ def test_oof_leakage_guard_raises_for_train_case():
         label_of={0: "M", 1: "B"},
     )
 
-    with pytest.raises(ValueError, match="train"):
+    # The leakage guard must raise ProvenanceError (ASC-01_02.7) — not a generic
+    # ValueError. This ensures the guard fires as a PRE-CONDITION before inference.
+    with pytest.raises(ProvenanceError, match="leakage"):
         generate_oof_candidates(
             fold=0,
             detector_ckpt="fake_ckpt",
@@ -316,7 +321,7 @@ def test_oof_leakage_guard_raises_for_train_case():
             case_ids_override=[1],
         )
 
-    # The inference function should NOT have been called
+    # The inference function should NOT have been called (pre-condition guard)
     assert call_log == []
 
 
@@ -468,6 +473,65 @@ def test_embedding_variance_gap_zero_ensemble_variance_handled():
 
 
 # ---------------------------------------------------------------------------
+# ASC-01_02.7 — explicit test: generate_oof_candidates leakage guard is a
+#               PRE-CONDITION that raises ProvenanceError BEFORE inference
+# ---------------------------------------------------------------------------
+
+
+def test_asc_01_02_7_leakage_guard_is_precondition_raises_before_inference():
+    """ASC-01_02.7: generate_oof_candidates raises ProvenanceError BEFORE calling
+    inference_fn when any case_id is in train_ids(fold).
+
+    This is the in-code leakage guard that ASC-01_02.3 relies on. It must:
+      1. Raise ProvenanceError (not ValueError or any other exception type).
+      2. Fire BEFORE the inference function is called (pre-condition, not post).
+      3. Include "leakage" in the message so callers can identify it.
+    """
+    from abus.data.split import FoldSplit
+
+    # 3-fold synthetic split for simplicity:
+    #   fold 0 = [0, 1], fold 1 = [2, 3], fold 2 = [4, 5]
+    # Detector for fold=0 trains on folds 1+2 (cases 2,3,4,5).
+    # OOF cases for fold=0 are cases 0 and 1.
+    # Asking fold=0 detector to score case 2 (a train case) must raise.
+    synthetic_split = FoldSplit(
+        folds=[[0, 1], [2, 3], [4, 5]],
+        fold_of={0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2},
+        seed=42,
+        splitter_version="1.0",
+        label_of={0: "M", 1: "B", 2: "M", 3: "B", 4: "M", 5: "B"},
+    )
+
+    inference_called = []
+
+    def inference_stub(case_ids: list[int]) -> list[RawCandidate]:
+        inference_called.extend(case_ids)
+        return []
+
+    # case_ids_override=[2] → case 2 is in train_ids(0) → must raise ProvenanceError
+    with pytest.raises(ProvenanceError) as exc_info:
+        generate_oof_candidates(
+            fold=0,
+            detector_ckpt="fake_ckpt",
+            nndet_dataset_root="fake_root",
+            inference_fn=inference_stub,
+            split_override=synthetic_split,
+            case_ids_override=[2],  # train case for fold=0
+        )
+
+    # Must be ProvenanceError specifically
+    assert isinstance(exc_info.value, ProvenanceError)
+    assert (
+        "leakage" in str(exc_info.value).lower()
+    ), f"Expected 'leakage' in error message, got: {exc_info.value}"
+
+    # The inference function must NOT have been called (pre-condition, not post)
+    assert (
+        inference_called == []
+    ), f"inference_fn was called before the leakage guard fired: {inference_called}"
+
+
+# ---------------------------------------------------------------------------
 # Additional: RawCandidate is frozen (immutable)
 # ---------------------------------------------------------------------------
 
@@ -500,3 +564,119 @@ def test_serialisation_preserves_fold_of():
         loaded = RawCandidateSet.load(path)
 
     assert loaded._fold_of == fold_of
+
+
+# ---------------------------------------------------------------------------
+# ASC-01_02.4 (D01.12) — source_detector cross-validation helper
+# ---------------------------------------------------------------------------
+
+
+def test_source_detector_cross_validation_agrees():
+    """Synthetic per-detector proposals produce consistent source_detectors sets
+    whether combined via ensemble_combine (branch-b fallback) or simply assigned.
+
+    This tests the *helper logic* that validates branch-(a) vs branch-(b) agreement
+    on the server. The synthetic version: create per-fold proposals for one case,
+    combine them via ensemble_combine, verify that the resulting source_detectors
+    equals the expected set of contributing folds.
+
+    On the server, this test's logic is exercised by comparing the branch-(a)
+    consolidated nndet_predict output against branch-(b)'s per-fold predict_oof
+    calls on five specific val cases (D01.12 clause in ASC-01_02.4).
+    """
+    # Five fold detectors each contribute one proposal for case_id=100.
+    # All proposals overlap (same bbox), so WBC should collapse them into one cluster.
+    embs = [np.full(4, float(i), dtype=np.float32) for i in range(5)]
+    scores = [0.9, 0.8, 0.7, 0.6, 0.5]
+
+    proposals = [_candidate(100, "val", (i,), score=scores[i], emb=embs[i]) for i in range(5)]
+
+    # IoU threshold = 0 ensures all identical-bbox proposals cluster together.
+    combined = ensemble_combine(proposals, iou_threshold=0.0)
+
+    assert len(combined) == 1, "All 5 overlapping proposals should form 1 cluster"
+    cluster = combined[0]
+
+    # All 5 fold detectors should be listed as source_detectors
+    assert set(cluster.source_detectors) == {
+        0,
+        1,
+        2,
+        3,
+        4,
+    }, f"Expected {{0,1,2,3,4}} source_detectors, got {cluster.source_detectors}"
+
+    # Score should be mean of the 5 scores
+    expected_score = float(np.mean(scores))
+    assert (
+        abs(cluster.score - expected_score) < 1e-5
+    ), f"Expected score {expected_score}, got {cluster.score}"
+
+    # Embedding should be mean of the 5 embeddings
+    expected_emb = np.mean(np.stack(embs), axis=0).astype(np.float32)
+    np.testing.assert_allclose(cluster.embedding, expected_emb, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# generate_ensemble_candidates public API (S4 — was untested)
+# ---------------------------------------------------------------------------
+
+
+def test_generate_ensemble_candidates_val_split():
+    """generate_ensemble_candidates routes val cases through ensemble_combine.
+
+    Verifies the public API is exercised: five fold detectors each propose one
+    overlapping candidate for case_id=100 in the val split. With IoU threshold=0
+    all proposals cluster into one combined candidate with source_detectors={0..4}.
+    """
+    # Each "fold detector" returns one proposal for case_id=100.
+    fold_proposals = {
+        fold: [_candidate(100, "val", (fold,), score=0.9 - fold * 0.1)] for fold in range(5)
+    }
+
+    def inference_stub(fold_id: int, case_ids: list[int]) -> list[RawCandidate]:
+        # Re-tag with the correct fold id (generate_ensemble_candidates overrides anyway)
+        return fold_proposals[fold_id]
+
+    # detector_ckpts: fold_id -> ckpt path (paths are unused by the stub)
+    detector_ckpts = {fold: f"/fake/fold{fold}/model_best.ckpt" for fold in range(5)}
+
+    result = generate_ensemble_candidates(
+        split="val",
+        detector_ckpts=detector_ckpts,
+        nndet_dataset_root="/fake/root",
+        inference_fn=inference_stub,
+    )
+
+    # WBC default threshold (0.5) — all proposals have the same bbox (overlap > 0.5)
+    # so they should collapse into one cluster.
+    assert len(result) == 1, f"Expected 1 combined candidate, got {len(result)}"
+    c = result[0]
+    assert c.split == "val"
+    assert c.case_id == 100
+    assert set(c.source_detectors) == {0, 1, 2, 3, 4}
+    # Score should be the mean of all 5 fold scores
+    expected_score = float(np.mean([0.9, 0.8, 0.7, 0.6, 0.5]))
+    assert abs(c.score - expected_score) < 1e-5
+
+
+def test_generate_ensemble_candidates_raises_for_train_split():
+    """generate_ensemble_candidates raises ValueError for split='train'."""
+    with pytest.raises(ValueError, match="train"):
+        generate_ensemble_candidates(
+            split="train",
+            detector_ckpts={},
+            nndet_dataset_root="/fake",
+            inference_fn=lambda fold, cids: [],
+        )
+
+
+def test_generate_ensemble_candidates_raises_without_inference_fn():
+    """generate_ensemble_candidates raises NotImplementedError when inference_fn is None."""
+    with pytest.raises(NotImplementedError):
+        generate_ensemble_candidates(
+            split="val",
+            detector_ckpts={0: "/fake"},
+            nndet_dataset_root="/fake",
+            inference_fn=None,
+        )

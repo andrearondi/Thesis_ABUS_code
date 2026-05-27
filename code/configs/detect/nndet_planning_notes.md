@@ -39,23 +39,23 @@ These are the exact commands the runbook runs on the server:
 # Job 1 — dataset build (CPU-bound, ~10–30 min)
 python scripts/build_nndet_dataset.py \
   --tdsc-root /home/maia-user/Andre/data \
-  --out-root  /home/maia-user/Andre/outputs/nndet \
+  --out-root  /home/maia-user/nndet_data \
   --config    configs/detect/nndet_dataset.yaml
 
 # Job 2 — nnDetection planning/preprocessing
 nndet_prep \
   Task001 \
-  /home/maia-user/Andre/outputs/nndet \
+  /home/maia-user/nndet_data \
   --num_processes 8
 
 nndet_unpack \
   Task001 \
-  /home/maia-user/Andre/outputs/nndet \
+  /home/maia-user/nndet_data \
   --num_processes 8
 
 # Job 3 — verification
 python scripts/verify_nndet_dataset.py \
-  --task-dir /home/maia-user/Andre/outputs/nndet/Task001_TDSCABUS \
+  --task-dir /home/maia-user/nndet_data/Task001_TDSCABUS \
   --case-id  <any_train_case_id>
 ```
 

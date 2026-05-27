@@ -107,17 +107,31 @@ def main() -> None:
             figsize = (long_in * w / h, long_in) if h >= w else (long_in, long_in * h / w)
             fig, ax = plt.subplots(figsize=figsize)
             ax.imshow(
-                img, cmap="gray", origin="upper", aspect="equal",
-                vmin=lo, vmax=hi, interpolation="nearest",
+                img,
+                cmap="gray",
+                origin="upper",
+                aspect="equal",
+                vmin=lo,
+                vmax=hi,
+                interpolation="nearest",
             )
-            ax.add_patch(patches.Rectangle(
-                (bb_min[ca], bb_min[ra]),
-                bb_max[ca] - bb_min[ca] + 1, bb_max[ra] - bb_min[ra] + 1,
-                linewidth=1.4, edgecolor="red", facecolor="none",
-            ))
+            ax.add_patch(
+                patches.Rectangle(
+                    (bb_min[ca], bb_min[ra]),
+                    bb_max[ca] - bb_min[ca] + 1,
+                    bb_max[ra] - bb_min[ra] + 1,
+                    linewidth=1.4,
+                    edgecolor="red",
+                    facecolor="none",
+                )
+            )
             ax.plot([centroid[ca]], [centroid[ra]], "r+", markersize=13, markeredgewidth=1.6)
-            ax.set_xlabel(f"d{ca}  -- storage axis {ca}  (n={marr.shape[ca]}, {sp[ca]:.3f} mm/voxel)")
-            ax.set_ylabel(f"d{ra}  -- storage axis {ra}  (n={marr.shape[ra]}, {sp[ra]:.3f} mm/voxel)")
+            ax.set_xlabel(
+                f"d{ca}  -- storage axis {ca}  (n={marr.shape[ca]}, {sp[ca]:.3f} mm/voxel)"
+            )
+            ax.set_ylabel(
+                f"d{ra}  -- storage axis {ra}  (n={marr.shape[ra]}, {sp[ra]:.3f} mm/voxel)"
+            )
             ax.set_title(
                 f"case {cid} [{lab}]  --  slice along axis {axis} @ idx {idx}\n"
                 f"plane d{ra} (vertical) x d{ca} (horizontal)  --  voxel-equal aspect"

@@ -12,10 +12,10 @@ Train all folds sequentially:
 Train fold 0 only and print the cost-checkpoint extrapolation:
     python scripts/train_all_folds.py --fold 0 --cost-checkpoint
 
-Required environment variables:
-    NNDET_PREPROCESSED   — path to the nnDetection preprocessed Task directory
-    DET_MODELS           — path for nnDetection training artefacts (checkpoints, logs)
-    NNDET_DIR            — path to the nnDetection source repo (for commit hash)
+Required environment variables (lowercase — nnDetection reads these via os.environ):
+    det_data   — nnDetection dataset root (Task directory parent)
+    det_models — nnDetection model output root (same as det_data for our task)
+    NNDET_DIR  — path to the nnDetection source repo (for commit hash; optional)
 
 All five folds are trained strictly sequentially on a single GPU (user decision
 D01.5, 2026-05-18). Job 1 (fold 0) is always run alone first to enable the
@@ -59,7 +59,9 @@ from abus.detect.train import DetectorRun, train_fold_detector
 TASK_NAME = "Task001_TDSCABUS"
 COST_TRIGGER_GPU_H = 1300.0
 N_FOLDS = 5
-ARCHITECTURE = "RetinaUNet000"
+# D01.9: was "RetinaUNet000" (incorrect). Verified correct value from nnDetection 0.1
+# commit 97a58f3: exp.id = <exp.model>_<planner_id> = RetinaUNetV001_D3V001_3d.
+EXP_ID = "RetinaUNetV001_D3V001_3d"
 
 
 # ---------------------------------------------------------------------------
@@ -216,14 +218,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--nndet-preprocessed",
-        default=os.environ.get("NNDET_PREPROCESSED", ""),
-        help="nnDetection preprocessed Task directory (env: NNDET_PREPROCESSED).",
+        "--det-data",
+        default=os.environ.get("det_data", ""),
+        help=(
+            "nnDetection dataset root (env: det_data — lowercase). "
+            "Example: /home/maia-user/nndet_data"
+        ),
     )
     parser.add_argument(
         "--det-models",
-        default=os.environ.get("DET_MODELS", ""),
-        help="nnDetection model output root (env: DET_MODELS).",
+        default=os.environ.get("det_models", ""),
+        help=(
+            "nnDetection model output root (env: det_models — lowercase). "
+            "For our task: same as det_data."
+        ),
     )
     parser.add_argument(
         "--nndet-dir",
@@ -237,20 +245,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.nndet_preprocessed:
+    if not args.det_data:
         parser.error(
-            "--nndet-preprocessed or $NNDET_PREPROCESSED must be set "
-            "(path to the nnDetection preprocessed Task directory)."
+            "--det-data or $det_data must be set (lowercase env var; "
+            "nnDetection silently ignores the uppercase DET_DATA). "
+            "Example: export det_data=/home/maia-user/nndet_data"
         )
     if not args.det_models:
         parser.error(
-            "--det-models or $DET_MODELS must be set " "(path for nnDetection training artefacts)."
+            "--det-models or $det_models must be set (lowercase env var; "
+            "nnDetection silently ignores the uppercase DET_MODELS)."
         )
 
     nndet_commit = _get_nndet_commit(args.nndet_dir)
     print(f"nnDetection commit: {nndet_commit}")
     print(f"Task: {TASK_NAME}")
-    print(f"Architecture: {ARCHITECTURE}")
+    print(f"Experiment id (exp.id): {EXP_ID}")
 
     folds_to_train = [args.fold] if args.fold is not None else list(range(N_FOLDS))
     all_runs: list[DetectorRun] = []
@@ -263,7 +273,7 @@ def main() -> None:
         try:
             run = train_fold_detector(
                 fold=fold,
-                nndet_dataset_root=args.nndet_preprocessed,
+                nndet_dataset_root=args.det_data,
                 out_root=args.det_models,
                 task_name=TASK_NAME,
                 nndet_commit=nndet_commit,
@@ -279,8 +289,10 @@ def main() -> None:
         print(f"  GPU-hours:  {run.gpu_hours:.2f} GPU-h")
         print(f"  Final val metric: {run.final_val_metric:.4f}")
 
-        # Prune intermediate checkpoints (user decision D01.5)
-        ckpt_dir = Path(args.det_models) / TASK_NAME / ARCHITECTURE / str(fold)
+        # Prune intermediate checkpoints (user decision D01.5).
+        # ckpt dir layout: $det_models/<TASK>/<EXP_ID>/fold<N>/
+        # Note: "fold0" not "0" (D01.9 verified layout).
+        ckpt_dir = Path(args.det_models) / TASK_NAME / EXP_ID / f"fold{fold}"
         if ckpt_dir.exists():
             _prune_intermediate_checkpoints(ckpt_dir)
 

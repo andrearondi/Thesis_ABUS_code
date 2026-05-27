@@ -1,18 +1,33 @@
-"""nnDetection fold-training wrapper (STORY_01_02).
+"""nnDetection fold-training wrapper (STORY_01_02, D01.9).
 
-Thin wrapper around the nnDetection training CLI. Invokes the CLI for one fold,
-captures the run metadata (checkpoint path, wall-clock, GPU-hours, final
-internal-validation metric, nnDetection commit), and returns a DetectorRun.
+Thin wrapper around the nnDetection training console script. Invokes
+``nndet_train <task_name> -o exp.fold=<N>`` for one fold, captures the run
+metadata (checkpoint path, wall-clock, GPU-hours, final internal-validation
+metric, nnDetection commit), and returns a DetectorRun.
+
+nnDetection 0.1 CLI surface (verified against commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5):
+  Console script: ``nndet_train``
+  Signature: ``nndet_train <TASK> [-o OVERWRITES ...] [--sweep]``
+  Fold is passed as a Hydra override: ``-o exp.fold=<N>``
+  There is NO model positional, NO ``--fold`` flag.
+
+nnDetection 0.1 checkpoint output layout (from scripts/train.py:init_train_dir):
+  ``$det_models/<task_name>/<exp.id>/fold<N>/``
+  where exp.id defaults to ``<exp.model>_<planner_id>``
+      = ``RetinaUNetV001_D3V001_3d`` for our task.
+  Fold subdir is ``fold0``, NOT ``0``.
+
+Env-var contract (lowercase — nnDetection reads these via os.environ):
+  ``det_data`` — nnDetection dataset root
+  ``det_models`` — nnDetection model output root
+  Do NOT use uppercase DET_MODELS / DET_DATA; nnDetection silently ignores them.
 
 No architecture or schedule modification — nnDetection default schedule is used
 (thesis §3.2.3 pre-registered: the detector is not tuned). Not a free parameter.
 
-GPU note: training itself requires a GPU and the nnDetection environment. This
-module is importable on the laptop (no GPU imports at module level) but
-train_fold_detector will fail locally without nnDetection.
-
-The module is CPU-safe: all imports at module level are stdlib-only
-(subprocess, time, pathlib, re) — no GPU or nnDetection imports.
+GPU note: training requires a GPU and the nnDetection environment. This module is
+importable on the laptop (all module-level imports are stdlib-only: subprocess,
+time, pathlib, re). train_fold_detector will fail without nnDetection in PATH.
 """
 
 from __future__ import annotations
@@ -22,6 +37,22 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Constants (pinned; changes here invalidate existing checkpoints)
+# ---------------------------------------------------------------------------
+
+#: nnDetection experiment id (model_id + planner_id), verified by user:
+#: preprocessed/D3V001_3d/ is present → planner_id = D3V001_3d.
+#: D01.9: was "RetinaUNet000" (incorrect); correct value is "RetinaUNetV001_D3V001_3d".
+EXP_ID: str = "RetinaUNetV001_D3V001_3d"
+
+#: nnDetection task name (matches STORY_01_01 build).
+TASK_NAME: str = "Task001_TDSCABUS"
+
+#: nnDetection 0.1 commit hash (reproducibility, agent_rules §12).
+NNDET_COMMIT_PINNED: str = "97a58f3110b71caf1b4bcc1851e67cf11e987fc5"
+
 
 # ---------------------------------------------------------------------------
 # DetectorRun
@@ -34,22 +65,21 @@ class DetectorRun:
 
     Attributes
     ----------
-    fold:
+    fold : int
         Fold index (0–4) trained.
-    checkpoint_path:
+    checkpoint_path : str
         Absolute path to the best-metric checkpoint saved by nnDetection.
-    wall_clock_hours:
+        Under ``$det_models/<task_name>/<exp.id>/fold<N>/``.
+    wall_clock_hours : float
         Total wall-clock time for the training run, in hours.
-    gpu_hours:
-        GPU-hours consumed (wall_clock_hours × number_of_GPUs).
-        For a single-GPU run: gpu_hours == wall_clock_hours.
-    final_val_metric:
+    gpu_hours : float
+        GPU-hours consumed (wall_clock_hours × n_gpus).
+        Single-GPU run (user decision D01.5): gpu_hours == wall_clock_hours.
+    final_val_metric : float
         Final internal-validation metric reported by nnDetection's trainer
         (typically FROC or mAP at the best-metric checkpoint).
-    nndet_commit:
-        nnDetection version+commit hash used (reproducibility, agent_rules §12).
-        Format: "v0.x" or a full commit hash from
-        ``git -C <nndet_dir> rev-parse HEAD``.
+    nndet_commit : str
+        nnDetection version+commit used (reproducibility, agent_rules §12).
     """
 
     fold: int
@@ -69,51 +99,48 @@ def train_fold_detector(
     fold: int,
     nndet_dataset_root: str,
     out_root: str,
-    task_name: str = "Task001_TDSCABUS",
-    nndet_module: str = "nndet.entrypoints.train",
+    task_name: str = TASK_NAME,
+    exp_id: str = EXP_ID,
     n_gpus: int = 1,
-    nndet_commit: str = "unknown",
+    nndet_commit: str = NNDET_COMMIT_PINNED,
 ) -> DetectorRun:
-    """Invoke the nnDetection default training CLI for one fold.
+    """Invoke the nnDetection default training console script for one fold.
 
-    Trains on train_ids(fold) = all cases NOT in fold ``fold``, using the
-    nnDetection default schedule (RetinaUNet, default augmentation, early
+    Trains on train_ids(fold) = all 80 cases NOT in fold ``fold``, using the
+    nnDetection default schedule (Retina U-Net, default augmentation, early
     stopping on the internal validation metric). No architecture or schedule
     modification (thesis §3.2.3).
 
-    The fold training is launched via:
-        python -m nndet.entrypoints.train <task_name> RetinaUNet000 \
-            --fold <fold> --overwrites "train.fold=<fold>"
+    Mechanics (D01.9 — verified against nnDetection 0.1 commit 97a58f3):
+      Calls ``nndet_train <task_name> -o exp.fold=<fold>`` via subprocess.
+      No model positional, no ``--fold`` flag — fold is a Hydra override.
+      Requires ``det_data`` and ``det_models`` env vars set (lowercase).
 
-    The checkpoint output lives under:
-        <out_root>/<task_name>/RetinaUNet000/<fold>/
-
-    On completion, the function:
-      1. Locates the best-metric checkpoint (``model_best.ckpt``).
-      2. Records wall-clock time.
-      3. Parses the final val metric from nnDetection's training log.
-      4. Returns a DetectorRun with all fields populated.
+    Output layout (nnDetection 0.1, from scripts/train.py:init_train_dir):
+      ``$det_models/<task_name>/<exp_id>/fold<N>/``
+      Note: fold subdir is ``fold0``, not ``0``.
 
     Parameters
     ----------
-    fold:
+    fold : int
         Fold index 0–4.
-    nndet_dataset_root:
-        Path to the nnDetection dataset root directory containing
-        ``Task001_TDSCABUS/``.
-    out_root:
-        Output root for nnDetection training artefacts (models, logs).
-        Maps to nnDetection's ``det_models`` directory.
-    task_name:
+    nndet_dataset_root : str
+        Path to the nnDetection dataset root containing ``<task_name>/``.
+        This is the ``det_data`` directory (passed as env var or via the
+        runbook; this argument is used as the subprocess cwd).
+    out_root : str
+        Output root for nnDetection training artefacts.
+        Maps to nnDetection's ``det_models`` env var.
+    task_name : str
         nnDetection task name (default ``"Task001_TDSCABUS"``).
-    nndet_module:
-        Python module path for the nnDetection training entrypoint.
-    n_gpus:
-        Number of GPUs used (for GPU-hour computation). Default 1 (sequential
-        fold training; user decision at epic-approval gate 2026-05-18, D01.5).
-    nndet_commit:
-        nnDetection commit hash string (reproducibility). Passed in by the
-        calling script (``scripts/train_all_folds.py``).
+    exp_id : str
+        nnDetection experiment id (``<exp.model>_<planner_id>``).
+        Default ``"RetinaUNetV001_D3V001_3d"``.
+    n_gpus : int
+        Number of GPUs (for GPU-hour computation). Default 1 (sequential
+        fold training; user decision D01.5, 2026-05-18).
+    nndet_commit : str
+        nnDetection commit hash string (reproducibility).
 
     Returns
     -------
@@ -124,31 +151,33 @@ def train_fold_detector(
     RuntimeError
         If the training subprocess exits with a non-zero return code.
     FileNotFoundError
-        If the expected checkpoint is not found after training completes.
+        If no best-metric checkpoint is found after training completes.
     """
     start_time = time.time()
 
-    # nnDetection training CLI call.
-    # The fold is passed as both a positional override and an explicit flag to
-    # ensure nnDetection uses exactly the frozen 5-fold splits file.
+    # nnDetection 0.1 training CLI:
+    #   nndet_train <TASK> -o exp.fold=<N>
+    # No model positional. No --fold flag. Fold is a Hydra override.
     cmd = [
-        "python",
-        "-m",
-        nndet_module,
+        "nndet_train",
         task_name,
-        "RetinaUNet000",
-        "--fold",
-        str(fold),
+        "-o",
+        f"exp.fold={fold}",
     ]
 
-    result = subprocess.run(cmd, cwd=nndet_dataset_root, capture_output=True, text=True)
+    result = subprocess.run(  # noqa: S603  (trusted project-only command)
+        cmd,
+        cwd=nndet_dataset_root,
+        capture_output=True,
+        text=True,
+    )
     if result.returncode != 0:
         raise RuntimeError(
             f"nnDetection training failed for fold {fold}.\n"
             f"Command: {' '.join(cmd)}\n"
             f"Return code: {result.returncode}\n"
-            f"stdout:\n{result.stdout[-3000:]}\n"
-            f"stderr:\n{result.stderr[-3000:]}\n"
+            f"stdout (last 3000 chars):\n{result.stdout[-3000:]}\n"
+            f"stderr (last 3000 chars):\n{result.stderr[-3000:]}\n"
         )
 
     wall_clock_seconds = time.time() - start_time
@@ -156,26 +185,15 @@ def train_fold_detector(
     gpu_hours = wall_clock_hours * n_gpus
 
     # Locate the best-metric checkpoint.
-    # nnDetection writes checkpoints to:
-    #   <det_models>/<task_name>/RetinaUNet000/<fold>/
-    # The best-metric checkpoint is typically named ``model_best.ckpt``.
-    ckpt_dir = Path(out_root) / task_name / "RetinaUNet000" / str(fold)
-    best_ckpt = ckpt_dir / "model_best.ckpt"
-    if not best_ckpt.exists():
-        # Try alternative naming conventions
-        candidates = list(ckpt_dir.glob("*best*.ckpt")) + list(ckpt_dir.glob("*best*.pth"))
-        if candidates:
-            best_ckpt = candidates[0]
-        else:
-            raise FileNotFoundError(
-                f"Best-metric checkpoint not found under {ckpt_dir}. "
-                "Expected 'model_best.ckpt' or similar. "
-                "Check the nnDetection training output directory."
-            )
+    # nnDetection 0.1 writes to:
+    #   $det_models/<task_name>/<exp_id>/fold<N>/
+    # The fold subdir is f"fold{N}", not str(N).
+    # Checkpoint filename is nnDetection's default (typically "model_best.ckpt");
+    # we search for the canonical name first, then fall back to a glob.
+    fold_dir = Path(out_root) / task_name / exp_id / f"fold{fold}"
+    best_ckpt = _locate_best_checkpoint(fold_dir)
 
-    # Parse final val metric from stdout.
-    # nnDetection logs lines like: "Best val metric: 0.8234" or
-    # "metric_0: 0.82" depending on the version. We extract the last float.
+    # Parse the final val metric from nnDetection's stdout.
     final_val_metric = _parse_final_val_metric(result.stdout)
 
     return DetectorRun(
@@ -188,15 +206,50 @@ def train_fold_detector(
     )
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _locate_best_checkpoint(fold_dir: Path) -> Path:
+    """Find the best-metric checkpoint in ``fold_dir``.
+
+    nnDetection 0.1 checkpoint filename is the default from its checkpoint
+    callback — typically ``model_best.ckpt``. We try canonical names first,
+    then fall back to a glob.
+
+    [SERVER-SIDE AUDIT REQUIRED: confirm the exact checkpoint filename against
+    nnDetection 0.1's checkpoint callback at
+    ``nndet/training/callbacks/checkpoint.py`` before the first server run.]
+    """
+    # Canonical candidates in priority order
+    for name in ("model_best.ckpt", "best.ckpt", "best_model.ckpt"):
+        candidate = fold_dir / name
+        if candidate.exists():
+            return candidate
+
+    # Fallback: glob for any *best* checkpoint
+    glob_hits = sorted(fold_dir.glob("*best*.ckpt")) + sorted(fold_dir.glob("*best*.pth"))
+    if glob_hits:
+        return glob_hits[0]
+
+    raise FileNotFoundError(
+        f"Best-metric checkpoint not found under {fold_dir}. "
+        "Expected a file matching 'model_best.ckpt' or '*best*.ckpt'. "
+        "Check the nnDetection 0.1 training output directory. "
+        "[SERVER-SIDE AUDIT: confirm the exact checkpoint filename from the "
+        "nnDetection 0.1 checkpoint callback before the first server run.]"
+    )
+
+
 def _parse_final_val_metric(log_text: str) -> float:
     """Extract the final validation metric float from nnDetection's stdout.
 
-    Scans lines for "best" or "val" followed by a float. Returns the last
-    such match, or 0.0 if no metric is found (non-blocking: the training
-    completed even if log parsing fails).
+    Scans for lines containing a float after 'best', 'val', or 'metric'.
+    Returns the last such match, or 0.0 if none found. Non-blocking: training
+    completed even if log parsing fails (returns 0.0 as a sentinel).
     """
     metric = 0.0
-    # Pattern: any line containing a float after "best" or "val" or "metric"
     pattern = re.compile(r"(?:best|val|metric)[^0-9\-]*([0-9]+\.[0-9]+)", re.IGNORECASE)
     for match in pattern.finditer(log_text):
         try:

@@ -11,8 +11,13 @@
 task_name: "Task001_TDSCABUS"
 task_id: 1
 
-# nnDetection architecture — default Retina U-Net (thesis §3.2.3, not tuned)
-architecture: "RetinaUNet000"
+# nnDetection experiment id (exp.id = <exp.model>_<planner_id>).
+# D01.9: was "RetinaUNet000" (incorrect). Verified correct value:
+#   exp.model = RetinaUNetV001, planner_id = D3V001_3d (confirmed by user:
+#   preprocessed/D3V001_3d/ is present in the nnDetection dataset).
+# This is the directory segment under $det_models/<task_name>/
+# and the MODEL positional for nndet_consolidate / nndet_predict.
+exp_id: "RetinaUNetV001_D3V001_3d"
 
 # Training schedule — nnDetection default (pre-registered, not a free parameter)
 # No architecture or schedule modification (thesis §3.2.3).
@@ -28,10 +33,11 @@ fold_ids: [0, 1, 2, 3, 4]
 # folds trained strictly sequentially on a single GPU, one at a time.
 fold_parallelism: "sequential"
 
-# Checkpoint output root (server path, from server_layout.md)
-# The actual path on the server is /home/maia-user/Andre/checkpoints/
-# Relative to det_models env var or passed explicitly to scripts.
-checkpoint_root: "/home/maia-user/Andre/checkpoints"
+# Checkpoint output root (nnDetection 0.1 layout, D01.9 verified):
+#   $det_models/<task_name>/<exp_id>/fold<N>/
+# where fold subdir is "fold0", "fold1", ..., "fold4" (NOT "0", "1", ...).
+# $det_models = /home/maia-user/nndet_data (from server_layout.md, lowercase env var).
+checkpoint_layout: "$det_models/{task_name}/{exp_id}/fold{N}/"
 
 # Checkpoint retention policy (user decision D01.5, 2026-05-18):
 # Keep only the best-metric and the final ("last") checkpoint per fold.

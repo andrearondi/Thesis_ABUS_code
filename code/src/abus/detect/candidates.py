@@ -519,8 +519,9 @@ def generate_oof_candidates(
 
     Raises
     ------
-    ValueError
-        If any case_id to be scored is in train_ids(fold) (leakage guard).
+    ProvenanceError
+        If any case_id to be scored is in train_ids(fold) (leakage guard, ASC-01_02.7).
+        Fires BEFORE inference_fn is called (pre-condition, not post-condition).
     NotImplementedError
         If inference_fn is None.
     """
@@ -533,14 +534,18 @@ def generate_oof_candidates(
     else:
         case_ids_to_score = sorted(oof_ids)
 
-    # Leakage guard: refuse to score any train-ids case.
+    # Leakage guard (ASC-01_02.7): refuse to score any train-ids case.
+    # Raises ProvenanceError (not ValueError) so the in-code guard is the same
+    # exception type as provenance_check — callers can catch one exception class
+    # for all leakage violations.  This is a PRE-CONDITION: it fires BEFORE
+    # inference_fn is ever called.
     leakage_cases = [cid for cid in case_ids_to_score if cid in train_ids]
     if leakage_cases:
-        raise ValueError(
+        raise ProvenanceError(
             f"OOF leakage guard triggered for fold={fold}: "
             f"the following case_ids are in train_ids({fold}) and must NOT be scored "
             f"by detector {fold}: {leakage_cases}. "
-            "Detector {fold} was trained on these cases — scoring them would violate "
+            f"Detector {fold} was trained on these cases — scoring them would violate "
             "the OOF leakage-control invariant (thesis §3.2.1)."
         )
 

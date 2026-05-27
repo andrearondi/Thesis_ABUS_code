@@ -4,7 +4,7 @@
 Usage (server):
     python scripts/build_nndet_dataset.py \\
         --tdsc-root /home/maia-user/Andre/data \\
-        --out-root  /home/maia-user/Andre/outputs/nndet \\
+        --out-root  /home/maia-user/nndet_data \\
         --config    configs/detect/nndet_dataset.yaml
 
 This script:

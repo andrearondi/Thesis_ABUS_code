@@ -24,14 +24,11 @@ _POS = (0.02, 0.15, 0.30, 0.50, 0.70, 0.85, 0.98)
 
 
 def main() -> None:
-    import numpy as np
-
     from abus.io.loader import load_volume
 
     case_ids = [int(a) for a in sys.argv[1:]] or [100]
-    hdr = (
-        f"{'case':>5} {'ax':>3} {'n':>5} {'mm/vox':>7} {'min':>6} {'max':>6}"
-        + "".join(f"  p{int(q * 100):02d}" for q in _POS)
+    hdr = f"{'case':>5} {'ax':>3} {'n':>5} {'mm/vox':>7} {'min':>6} {'max':>6}" + "".join(
+        f"  p{int(q * 100):02d}" for q in _POS
     )
     print(hdr, flush=True)
     print("-" * len(hdr), flush=True)
@@ -50,8 +47,7 @@ def main() -> None:
             samples = [p[min(n - 1, int(q * n))] for q in _POS]
             row = (
                 f"{cid:>5} {axis:>3} {n:>5} {sp[axis]:>7.3f} "
-                f"{p.min():>6.1f} {p.max():>6.1f}"
-                + "".join(f" {s:>5.1f}" for s in samples)
+                f"{p.min():>6.1f} {p.max():>6.1f}" + "".join(f" {s:>5.1f}" for s in samples)
             )
             print(row, flush=True)
         print(flush=True)
