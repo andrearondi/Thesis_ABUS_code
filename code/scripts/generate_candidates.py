@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -72,6 +73,8 @@ from abus.detect.candidates import (
 from abus.detect.ensemble import ensemble_combine
 from abus.detect.nndet_inference import RawDetections, parse_predictions_dir, predict_oof
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -88,24 +91,36 @@ NNDET_COMMIT = "97a58f3110b71caf1b4bcc1851e67cf11e987fc5"
 
 def _make_oof_inference_fn(
     fold: int,
-    task_dir: str,
-    model_dir: str,
+    preprocessed_dir: str,
+    fold_dir: str,
 ) -> Callable[[list[int]], list[RawCandidate]]:
     """Return an inference callable for OOF generation using predict_oof.
 
     The callable signature: (case_ids: list[int]) -> list[RawCandidate].
-    Internally calls predict_oof(fold, case_ids, task_dir, model_dir) which
-    uses nndet.inference.helper.predict_dir(case_ids=...).
+    Internally calls predict_oof(fold, case_ids, preprocessed_dir, fold_dir)
+    which uses nndet.inference.helper.predict_dir(case_ids=...) with the real
+    nnDetection 0.1 signature (D01.13).
+
+    Parameters
+    ----------
+    fold : int
+        Fold index (0–4).
+    preprocessed_dir : str
+        Path to preprocessed imagesTr directory (contains .npz case files).
+        e.g. ``$det_data/Task001_TDSCABUS/preprocessed/D3V001_3d/imagesTr``
+    fold_dir : str
+        Path to fold's training output (contains config.yaml + plan_inference.pkl).
+        e.g. ``$det_models/Task001_TDSCABUS/RetinaUNetV001_D3V001_3d/fold<N>``
     """
 
     def inference_fn(case_ids: list[int]) -> list[RawCandidate]:
-        """Run fold-``fold`` detector on ``case_ids`` via predict_oof."""
+        """Run fold-``fold`` detector on ``case_ids`` via predict_oof (D01.13)."""
         # predict_oof returns dict[int, RawDetections] keyed by case_id
         raw_dets = predict_oof(
             fold=fold,
             case_ids=case_ids,
-            task_dir=task_dir,
-            model_dir=model_dir,
+            preprocessed_dir=preprocessed_dir,
+            fold_dir=fold_dir,
         )
 
         candidates: list[RawCandidate] = []
@@ -126,9 +141,13 @@ def _make_oof_inference_fn(
 def _run_consolidate(task_name: str, exp_id: str) -> None:
     """Run nndet_consolidate to create the 5-fold ensemble metadata.
 
-    CLI: nndet_consolidate <TASK> <MODEL>
+    D01.13: --sweep_boxes is required (consolidate.py:130-132).
+    Without it, nndet_consolidate raises ValueError("Export needs new parameter sweep!")
+    because it consumes each fold's sweep_predictions/ dir (produced by --sweep).
+
+    CLI: nndet_consolidate <TASK> <MODEL> --sweep_boxes
     """
-    cmd = ["nndet_consolidate", task_name, exp_id]
+    cmd = ["nndet_consolidate", task_name, exp_id, "--sweep_boxes"]
     print(f"  Running: {' '.join(cmd)}")
     result = subprocess.run(  # noqa: S603
         cmd,
@@ -201,16 +220,29 @@ def _raw_detections_to_candidates(
         return candidates
 
     for i in range(rd.boxes.shape[0]):
-        # Boxes in nnDetection 0.1 format: (z1, y1, x1, z2, y2, x2) on resampled grid.
-        # [SERVER-SIDE AUDIT: confirm axis order against nnDetection 0.1 source
-        #  before first server run. See nndet_inference.py schema note.]
+        # D01.13 confirmed box axis: (x1, y1, x2, y2, z1, z2)
+        # Source: nndet/core/boxes/ops.py line 34, detection.py _apply_offsets_to_boxes
+        # Project axis vocabulary (EPIC_00 C1): x↔d2, y↔d1, z↔d0
         box = rd.boxes[i]
-        z1, y1, x1, z2, y2, x2 = (int(round(float(v))) for v in box)
+        x1, y1, x2, y2, z1, z2 = (int(round(float(v))) for v in box)
 
-        # Map to project BBox convention:
-        # project BBox: (min_d0, min_d1, min_d2, max_d0, max_d1, max_d2)
-        # nnDetection grid: z~d0, y~d1, x~d2 (to be confirmed by server audit)
-        # Use conservative inclusive-max by ensuring max > min.
+        # Guard: skip degenerate boxes (inverted coords are not produced by nnDetection's
+        # NMS but are checked defensively — a silent wrong BBox is worse than a skip).
+        if x2 < x1 or y2 < y1 or z2 < z1:
+            logger.warning(
+                "case %d: degenerate box [%d,%d,%d,%d,%d,%d] skipped",
+                rd.case_id,
+                x1,
+                y1,
+                x2,
+                y2,
+                z1,
+                z2,
+            )
+            continue
+
+        # Map (x1,y1,x2,y2,z1,z2) → project BBox (min_d0,min_d1,min_d2,max_d0,max_d1,max_d2)
+        # z→d0, y→d1, x→d2
         bbox = BBox(
             min_d0=z1,
             min_d1=y1,
@@ -321,13 +353,17 @@ def _generate_ensemble_branch_b(
     task_name: str,
     exp_id: str,
     split_case_ids: dict[str, list[int]],
-    task_dir: str,
+    preprocessed_dir: str,
     nndet_commit: str,
 ) -> dict[str, RawCandidateSet]:
     """Per-fold fallback: five predict_oof calls + ensemble_combine.
 
     Used when branch (a) cannot assign per-cluster source_detectors reliably,
     OR when the consolidated output is unavailable.
+
+    D01.13: uses real predict_dir signature; predict_oof takes preprocessed_dir
+    and fold_dir (not task_dir + model_dir). Val/test preprocessed files are in
+    imagesTr (all 200 cases were preprocessed into imagesTr for nndet_prep).
     """
 
     # Collect per-case proposals from all 5 fold detectors
@@ -337,14 +373,14 @@ def _generate_ensemble_branch_b(
     proposals_by_case: dict[int, list[RawCandidate]] = {cid: [] for cid in all_case_ids}
 
     for fold in range(5):
-        model_dir = str(Path(det_models_root) / task_name / exp_id / f"fold{fold}")
+        fold_dir = str(Path(det_models_root) / task_name / exp_id / f"fold{fold}")
         print(f"  Fold {fold}: running predict_oof for {len(all_case_ids)} val/test cases ...")
 
         raw_dets = predict_oof(
             fold=fold,
             case_ids=all_case_ids,
-            task_dir=task_dir,
-            model_dir=model_dir,
+            preprocessed_dir=preprocessed_dir,
+            fold_dir=fold_dir,
         )
 
         for case_id, rd in raw_dets.items():
@@ -415,7 +451,7 @@ def _print_summary_table(split: str, cset: RawCandidateSet) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate OOF + ensemble raw candidates (STORY_01_02, D01.9).",
+        description="Generate OOF + ensemble raw candidates (STORY_01_02, D01.13).",
     )
     parser.add_argument(
         "--det-data",
@@ -431,6 +467,15 @@ def main() -> None:
         help=(
             "nnDetection model output root (env: det_models — lowercase). "
             "For our task: same as det_data."
+        ),
+    )
+    parser.add_argument(
+        "--preprocessed-dir",
+        default=None,
+        help=(
+            "Path to preprocessed imagesTr directory for OOF inference. "
+            "D01.13: predict_dir reads preprocessed .npz files, not raw images. "
+            "Default: <det_data>/Task001_TDSCABUS/preprocessed/D3V001_3d/imagesTr"
         ),
     )
     parser.add_argument(
@@ -482,9 +527,14 @@ def main() -> None:
     if not args.det_models:
         parser.error("--det-models or $det_models must be set (lowercase env var).")
 
-    task_dir = str(Path(args.det_data) / TASK_NAME)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # D01.13: OOF inference reads preprocessed .npz files, not raw images.
+    preprocessed_dir = args.preprocessed_dir or str(
+        Path(args.det_data) / TASK_NAME / "preprocessed" / "D3V001_3d" / "imagesTr"
+    )
+    print(f"Preprocessed dir (OOF source): {preprocessed_dir}")
 
     # Load the frozen 5-fold split for provenance and case-id discovery
     split_manifest = load_split()
@@ -514,8 +564,8 @@ def main() -> None:
         all_oof: list[RawCandidate] = []
 
         for fold_id in range(5):
-            model_dir = str(Path(args.det_models) / TASK_NAME / EXP_ID / f"fold{fold_id}")
-            print(f"\nFold {fold_id}: {model_dir}")
+            fold_dir = str(Path(args.det_models) / TASK_NAME / EXP_ID / f"fold{fold_id}")
+            print(f"\nFold {fold_id}: {fold_dir}")
 
             oof_case_ids = split_manifest.oof_ids(fold_id)
             print(f"  OOF case_ids: {len(oof_case_ids)} cases")
@@ -523,15 +573,16 @@ def main() -> None:
             # The leakage guard in generate_oof_candidates fires BEFORE inference
             # (ASC-01_02.7). It raises ProvenanceError if any case_ids are
             # in train_ids(fold).
+            # D01.13: predict_oof now takes preprocessed_dir + fold_dir (real signature)
             inference_fn = _make_oof_inference_fn(
                 fold=fold_id,
-                task_dir=task_dir,
-                model_dir=model_dir,
+                preprocessed_dir=preprocessed_dir,
+                fold_dir=fold_dir,
             )
 
             fold_candidates = generate_oof_candidates(
                 fold=fold_id,
-                detector_ckpt=model_dir,
+                detector_ckpt=fold_dir,  # fold_dir contains model_last.ckpt (D01.13)
                 nndet_dataset_root=args.det_data,
                 inference_fn=inference_fn,
                 split_override=split_manifest,
@@ -580,7 +631,7 @@ def main() -> None:
                         task_name=TASK_NAME,
                         exp_id=EXP_ID,
                         split_case_ids=requested_split_ids,
-                        task_dir=task_dir,
+                        preprocessed_dir=preprocessed_dir,
                         nndet_commit=args.nndet_commit,
                     )
                     print("Ensemble branch (b) fallback complete.")
@@ -593,7 +644,7 @@ def main() -> None:
                 task_name=TASK_NAME,
                 exp_id=EXP_ID,
                 split_case_ids=requested_split_ids,
-                task_dir=task_dir,
+                preprocessed_dir=preprocessed_dir,
                 nndet_commit=args.nndet_commit,
             )
             print("Ensemble branch (b) complete.")

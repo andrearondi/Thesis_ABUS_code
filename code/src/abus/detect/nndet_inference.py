@@ -1,4 +1,4 @@
-"""Internal wrapper around nnDetection 0.1's predict_dir helper (STORY_01_02, D01.9).
+"""Internal wrapper around nnDetection 0.1's predict_dir helper (STORY_01_02, D01.13).
 
 This module is INTERNAL to the detect package — downstream stories (01_03, 01_04)
 and EPIC_02+ do NOT import from it. Only candidates.py uses it for the OOF path.
@@ -8,29 +8,32 @@ Two public objects:
   RawDetections
     Intermediate per-case detection record parsed from disk.
     Boxes are in nnDetection's resampled-grid convention (float32, shape (N,6)).
+    Box axis order: (x1, y1, x2, y2, z1, z2) — nndet/core/boxes/ops.py line 34.
     The public per-candidate type is RawCandidate in candidates.py.
 
   parse_predictions_dir(pred_dir) -> dict[int, RawDetections]
-    Discovers *_boxes.pkl files in pred_dir and parses them.
+    Discovers *_pred_boxes.pkl files in pred_dir and parses them.
 
-  predict_oof(fold, case_ids, task_dir, model_dir, ...) -> dict[int, RawDetections]
+  predict_oof(fold, case_ids, preprocessed_dir, fold_dir, ...) -> dict[int, RawDetections]
     Drives nnDetection 0.1's predict_dir(case_ids=...) helper for the OOF path.
     Requires the nnDetection conda env (server-only). Lazily imported so the
     module is importable on the laptop without nnDetection.
 
-nnDetection 0.1 output schema (commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5):
-  Files written by both the CLI path (nndet_predict) and the Python helper
-  (predict_dir) under <training_dir>/test_predictions/:
-    <case_id_4d>_boxes.pkl  — pickle of dict with keys:
-      'boxes':      np.ndarray shape (N, 6) float32  — resampled-grid coords
-      'scores':     np.ndarray shape (N,)   float32  — detection confidence
-      'embeddings': np.ndarray shape (N, D) float32  — backbone-pooled (optional)
+nnDetection 0.1 output schema (D01.13, source-grounded, commit 97a58f3):
+  predict_dir(save_state=False) writes ONE FILE PER KEY:
+    <case_id>_pred_boxes.pkl  — pickle of np.ndarray (N, 6) float32
+    <case_id>_pred_scores.pkl — pickle of np.ndarray (N,) float32
+    <case_id>_pred_labels.pkl — pickle of np.ndarray (N,) int
+  Source: helper.py:103-110 (to_numpy(result) → save_pickle(item, target_dir/f"{cid}_{key}.pkl"))
+  get_case_result keys: pred_boxes, pred_scores, pred_labels, restore, ...
+  NO embeddings key — embeddings are set to None and a zero placeholder is filled
+  by candidates.py until STORY_01_04 wires backbone extraction.
 
-  Schema-drift mitigation (Risk #5, D01.9):
-    These tests are the canary. If the real nnDetection output schema differs,
-    the unit tests in tests/test_nndet_inference.py will fail before this code
-    is ever run end-to-end. The senior engineer must confirm schema parity
-    between the CLI path and the Python helper path before the first server run.
+  Box axis (x1,y1,x2,y2,z1,z2):
+  Source: nndet/core/boxes/ops.py line 34, detection.py _apply_offsets_to_boxes line 228.
+
+  Schema-drift mitigation (Risk #5, D01.13):
+    These tests are the canary. Any schema change surfaces as a test failure.
 
 CPU safety:
   parse_predictions_dir is pure-Python + numpy; no GPU required.
@@ -59,7 +62,7 @@ class RawDetections:
     """Raw nnDetection predictions for one case, parsed from disk.
 
     Internal-only. The public per-candidate output type is RawCandidate
-    in candidates.py; this is the intermediate dict-of-arrays that
+    in candidates.py; this is the intermediate array record that
     generate_oof_candidates / generate_ensemble_candidates convert.
 
     Attributes
@@ -67,18 +70,14 @@ class RawDetections:
     case_id : int
     boxes : np.ndarray
         Shape (N, 6), nnDetection box convention, resampled grid. float32.
-        Format: (z1, y1, x1, z2, y2, x2) — inclusive coordinates on the
-        resampled voxel grid. This is the format nnDetection 0.1 writes.
-        [SERVER-SIDE AUDIT REQUIRED: confirm exact axis order against the
-        nnDetection 0.1 source at scripts/predict.py and inference/helper.py
-        before end-to-end execution.]
+        Axis order: (x1, y1, x2, y2, z1, z2) — per nndet/core/boxes/ops.py
+        line 34 and detection.py _apply_offsets_to_boxes (D01.13 confirmed).
     scores : np.ndarray
         Shape (N,), float32.
     embeddings : np.ndarray or None
-        Shape (N, D) float32 if available in the pickle, else None.
-        A zero-vector placeholder of shape (D,) is NOT inserted here —
-        the placeholder is inserted by the candidate pipeline (candidates.py)
-        which knows the expected embedding dimension D from the architecture.
+        Always None from predict_dir per-key output (D01.13: no embeddings
+        key in get_case_result). Zero-vector placeholder is filled by
+        candidates.py (which knows embedding dim D from config).
     """
 
     case_id: int
@@ -93,33 +92,35 @@ class RawDetections:
 
 
 def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
-    """Discover and parse nnDetection 0.1's ``*_boxes.pkl`` outputs in ``pred_dir``.
+    """Discover and parse nnDetection 0.1's per-key outputs in ``pred_dir``.
 
-    Returns a dict keyed by case_id (int, parsed from the nnDetection 0.1
-    filename stem ``<case_id_4d>_boxes.pkl``).
+    D01.13 schema (source-grounded, commit 97a58f3):
+      predict_dir(save_state=False) writes one file per result key:
+        <case_id>_pred_boxes.pkl  — np.ndarray (N, 6) float32
+        <case_id>_pred_scores.pkl — np.ndarray (N,) float32
+        <case_id>_pred_labels.pkl — np.ndarray (N,) int  (not used here)
+      Source: helper.py:103-110 ``for key, item in to_numpy(result).items(): ...``
+      Box axis: (x1, y1, x2, y2, z1, z2) — nndet/core/boxes/ops.py line 34.
+      NO embeddings key. RawDetections.embeddings is always None.
 
     Parsing rules:
-      - Only files matching the glob ``*_boxes.pkl`` are processed.
-      - Filename stem format: ``<case_id_4d>_boxes`` where ``<case_id_4d>``
+      - Only files matching ``*_pred_boxes.pkl`` are processed (anchors case discovery).
+      - Filename format: ``<case_id_str>_pred_boxes.pkl`` where ``<case_id_str>``
         is a zero-padded integer (e.g. ``0042``). The integer is extracted by
-        stripping the ``_boxes`` suffix and calling int().
-      - Files whose stem (before ``_boxes``) cannot be parsed as an integer
-        are skipped with a WARNING log. They do NOT raise an exception
-        (defect-prevention echo of the STORY_01_01 silent-zero failure —
-        D01.9: malformed filenames are logged, not silently absorbed).
-      - Each valid pickle is expected to contain a dict with keys:
-          'boxes':       np.ndarray (N, 6) float32
-          'scores':      np.ndarray (N,)   float32
-          'embeddings':  np.ndarray (N, D) float32  [optional]
-        Boxes and scores are coerced to float32. Missing 'embeddings' →
-        RawDetections.embeddings = None.
+        stripping ``_pred_boxes`` and calling int().
+      - Files whose prefix cannot be parsed as an integer are skipped with a
+        WARNING log (defect-prevention: logged, not silently absorbed — echo of
+        STORY_01_01 D01.9 silent-zero lesson).
+      - The corresponding ``*_pred_scores.pkl`` is loaded from the same directory.
+        If the scores file is missing, a WARNING is logged and the case is skipped.
+      - Boxes and scores are coerced to float32.
 
     Pure-Python; CPU-safe; no nnDetection required.
 
     Parameters
     ----------
     pred_dir : str
-        Path to the directory containing ``*_boxes.pkl`` files.
+        Path to the directory containing per-key pickle files.
 
     Returns
     -------
@@ -129,45 +130,57 @@ def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
     pred_path = Path(pred_dir)
     result: dict[int, RawDetections] = {}
 
-    pkl_files = sorted(pred_path.glob("*_boxes.pkl"))
+    # Anchor on *_pred_boxes.pkl — one per case (D01.13 per-key schema)
+    boxes_files = sorted(pred_path.glob("*_pred_boxes.pkl"))
 
-    for pkl_file in pkl_files:
-        stem = pkl_file.stem  # e.g. "0042_boxes"
-        # Strip the "_boxes" suffix to get the case_id string
-        if not stem.endswith("_boxes"):
+    for boxes_file in boxes_files:
+        stem = boxes_file.stem  # e.g. "0042_pred_boxes"
+        suffix = "_pred_boxes"
+        if not stem.endswith(suffix):
             logger.warning(
-                "parse_predictions_dir: skipping file %s — stem does not end with '_boxes'",
-                pkl_file.name,
+                "parse_predictions_dir: skipping file %s — unexpected stem %r",
+                boxes_file.name,
+                stem,
             )
             continue
 
-        case_id_str = stem[: -len("_boxes")]
+        case_id_str = stem[: -len(suffix)]
         try:
             case_id = int(case_id_str)
         except ValueError:
             logger.warning(
                 "parse_predictions_dir: skipping file %s — cannot parse integer case_id "
-                "from stem %r",
-                pkl_file.name,
+                "from prefix %r",
+                boxes_file.name,
                 case_id_str,
             )
             continue
 
-        with open(pkl_file, "rb") as f:
-            payload = pickle.load(f)  # noqa: S301  (trusted project-internal files)
+        # Load the corresponding scores file
+        scores_file = pred_path / f"{case_id_str}_pred_scores.pkl"
+        if not scores_file.exists():
+            logger.warning(
+                "parse_predictions_dir: skipping case_id=%d — scores file %s not found",
+                case_id,
+                scores_file.name,
+            )
+            continue
 
-        boxes = np.asarray(payload["boxes"], dtype=np.float32)
-        scores = np.asarray(payload["scores"], dtype=np.float32)
+        with open(boxes_file, "rb") as f:
+            boxes_raw = pickle.load(f)  # noqa: S301
+        with open(scores_file, "rb") as f:
+            scores_raw = pickle.load(f)  # noqa: S301
 
-        embeddings: np.ndarray | None = None
-        if "embeddings" in payload and payload["embeddings"] is not None:
-            embeddings = np.asarray(payload["embeddings"], dtype=np.float32)
+        boxes = np.asarray(boxes_raw, dtype=np.float32)
+        scores = np.asarray(scores_raw, dtype=np.float32)
 
+        # Embeddings are NOT in the per-key predict_dir output (D01.13).
+        # Zero-vector placeholder is filled by candidates.py.
         result[case_id] = RawDetections(
             case_id=case_id,
             boxes=boxes,
             scores=scores,
-            embeddings=embeddings,
+            embeddings=None,
         )
 
     return result
@@ -181,10 +194,9 @@ def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
 def predict_oof(
     fold: int,
     case_ids: list[int],
-    task_dir: str,
-    model_dir: str,
+    preprocessed_dir: str,
+    fold_dir: str,
     num_models: int = 1,
-    num_tta: int = 4,
 ) -> dict[int, RawDetections]:
     """Run the fold-``fold`` detector on ``case_ids`` via the nnDetection Python helper.
 
@@ -192,12 +204,42 @@ def predict_oof(
     surface in nnDetection 0.1. This function drives it via the documented Python
     helper ``nndet.inference.helper.predict_dir(case_ids=...)``.
 
-    Caller is responsible for the leakage guard — generate_oof_candidates asserts
-    ``set(case_ids) ⊆ oof_ids(fold)`` BEFORE calling predict_oof.
+    D01.13 implementation (source-grounded, helper.py:29-42):
 
-    This function writes predictions to a temporary directory, calls
-    parse_predictions_dir on that directory, and returns the parsed dict before
-    the tempdir is cleaned up.
+    Real predict_dir signature::
+
+        predict_dir(source_dir, target_dir, cfg, plan, source_models,
+                    model_fn=load_final_model, num_models=None,
+                    num_tta_transforms=None, restore=False,
+                    case_ids=None, save_state=False, **kwargs)
+
+    This function:
+      1. Loads ``cfg`` from ``<fold_dir>/config.yaml`` via OmegaConf.load.
+      2. Loads ``plan`` from ``<fold_dir>/plan_inference.pkl`` via nndet's
+         load_pickle (plan_inference.pkl only exists after ``--sweep`` ran,
+         which is why retraining with ``--sweep`` is required — D01.13 point 7).
+      3. Calls predict_dir with:
+         - source_dir   = preprocessed_dir (preprocessed .npz files location)
+         - target_dir   = a tempdir
+         - source_models = fold_dir (as Path)
+         - model_fn     = partial(load_final_model, identifier="last")
+           (SWA model_last is the pre-registered detector — thesis §3.2.3)
+         - num_models   = 1
+         - restore      = True  (restore boxes to original image space)
+         - case_ids     = [f"{cid:04d}" for cid in case_ids]
+           (4-digit zero-padded strings matching preprocessed .npz stems)
+         - save_state   = False (write per-key pkls; D01.13 per-key schema)
+      4. Parses the tempdir via parse_predictions_dir and returns the dict.
+
+    Caller (generate_oof_candidates) is responsible for the leakage guard —
+    it asserts ``set(case_ids) ⊆ oof_ids(fold)`` BEFORE calling predict_oof.
+
+    Candidate operating point (D01.13 point 6): use high-recall ensembler
+    defaults (model_score_thresh=0.0, ensemble_score_thresh=0.0,
+    model_topk=1000, model_detections_per_image=100). All four params are
+    explicitly overridden so a swept plan_inference.pkl cannot silently lower
+    topk/detections_per_image. STORY_01_03 owns the single project-wide
+    calibration; we must not use the FROC-optimal swept params here.
 
     Requires the nnDetection conda env (server-only). nnDetection is lazily
     imported inside this function so the module is importable on the laptop.
@@ -208,21 +250,21 @@ def predict_oof(
         Fold index (0–4). Used only for logging/traceability.
     case_ids : list[int]
         Integer case IDs to score (OOF ids for this fold, pre-validated by caller).
-    task_dir : str
-        Path to the nnDetection task directory
-        (``$det_data/<task_name>``).
-    model_dir : str
-        Path to the fold's training output directory
-        (``$det_models/<task_name>/<exp.id>/fold<N>``).
+    preprocessed_dir : str
+        Path to the preprocessed imagesTr directory containing ``.npz`` files.
+        (``$det_data/<task_name>/preprocessed/D3V001_3d/imagesTr``)
+    fold_dir : str
+        Path to the fold's training output directory containing
+        ``config.yaml`` and ``plan_inference.pkl``.
+        (``$det_models/<task_name>/<exp.id>/fold<N>``)
     num_models : int
-        Number of models to ensemble (1 for a single fold). Default 1.
-    num_tta : int
-        Number of test-time augmentation passes. Default 4 (nnDetection default).
+        Number of models (1 for a single fold). Default 1.
 
     Returns
     -------
     dict[int, RawDetections]
-        Keyed by case_id.
+        Keyed by case_id (int). Boxes in (x1,y1,x2,y2,z1,z2) axis.
+        embeddings is always None (D01.13: not in per-key output).
 
     Raises
     ------
@@ -231,41 +273,73 @@ def predict_oof(
     RuntimeError
         If predict_dir fails.
     """
-    # Lazy import — nnDetection is server-only; the module must remain importable
-    # on the laptop (thesis §3.2.3, D01.9 dependency note).
+    # Lazy imports — nnDetection is server-only; the module must remain importable
+    # on the laptop (thesis §3.2.3, D01.13 dependency note).
     try:
-        from nndet.inference.helper import predict_dir  # type: ignore[import-not-found]
+        from functools import partial as _partial
+
+        from nndet.inference.helper import predict_dir
+        from nndet.inference.loading import load_final_model
+        from nndet.io.load import load_pickle
+        from omegaconf import OmegaConf
     except ImportError as exc:
         raise ImportError(
-            "nnDetection is not installed in the current environment. "
+            "nnDetection / omegaconf is not installed in the current environment. "
             "predict_oof requires the nnDetection conda env (server-only). "
             "If running on the laptop, use the synthetic stub via generate_oof_candidates "
             "with an explicit inference_fn."
         ) from exc
 
+    fold_path = Path(fold_dir)
+
+    # Load config + plan from the fold's training output (created by --sweep).
+    cfg_path = fold_path / "config.yaml"
+    plan_path = fold_path / "plan_inference.pkl"
+    if not plan_path.exists():
+        raise FileNotFoundError(
+            f"plan_inference.pkl not found at {plan_path}. "
+            "This file is only created when nndet_train runs with --sweep. "
+            "Re-train this fold with --sweep (D01.13 requirement)."
+        )
+    cfg = OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)
+    plan = load_pickle(plan_path)
+
+    # Override swept inference params to high-recall defaults (D01.13 point 6).
+    # STORY_01_03 owns calibration; we must not use the FROC-optimal swept params here.
+    # Set ALL four ensembler params explicitly so sweep cannot silently lower topk/detections.
+    if "inference_plan" in plan:
+        plan["inference_plan"]["model_score_thresh"] = 0.0
+        plan["inference_plan"]["ensemble_score_thresh"] = 0.0
+        plan["inference_plan"]["model_topk"] = 1000
+        plan["inference_plan"]["model_detections_per_image"] = 100
+
+    # model_fn loads model_last (SWA checkpoint — pre-registered detector, thesis §3.2.3)
+    model_fn = _partial(load_final_model, identifier="last")
+
+    # case_ids as 4-digit zero-padded strings (matches preprocessed .npz stems)
+    case_ids_str = [f"{cid:04d}" for cid in case_ids]
+
     logger.info(
-        "predict_oof: fold=%d, %d case_ids, task_dir=%s, model_dir=%s",
+        "predict_oof: fold=%d, %d cases, preprocessed_dir=%s, fold_dir=%s",
         fold,
         len(case_ids),
-        task_dir,
-        model_dir,
+        preprocessed_dir,
+        fold_dir,
     )
 
     with tempfile.TemporaryDirectory() as out_dir:
-        # Call nnDetection 0.1's predict_dir with the case_ids list so only
-        # the OOF cases are scored.
-        # [SERVER-SIDE AUDIT REQUIRED: verify the exact signature of
-        #  predict_dir(case_ids=...) against nnDetection 0.1 source
-        #  nndet/inference/helper.py before first server run.]
         predict_dir(
-            task_dir=task_dir,
-            model_dir=model_dir,
-            output_dir=out_dir,
-            case_ids=case_ids,
+            source_dir=preprocessed_dir,
+            target_dir=out_dir,
+            cfg=cfg,
+            plan=plan,
+            source_models=fold_path,
+            model_fn=model_fn,
             num_models=num_models,
-            num_tta=num_tta,
+            restore=True,
+            case_ids=case_ids_str,
+            save_state=False,
         )
-
         detections = parse_predictions_dir(out_dir)
 
     logger.info(

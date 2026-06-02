@@ -155,14 +155,17 @@ def train_fold_detector(
     """
     start_time = time.time()
 
-    # nnDetection 0.1 training CLI:
-    #   nndet_train <TASK> -o exp.fold=<N>
+    # nnDetection 0.1 training CLI (D01.13):
+    #   nndet_train <TASK> -o exp.fold=<N> --sweep
     # No model positional. No --fold flag. Fold is a Hydra override.
+    # --sweep is REQUIRED: produces plan_inference.pkl and sweep_predictions/
+    # that predict_dir and nndet_consolidate need (D01.13 points 3-5).
     cmd = [
         "nndet_train",
         task_name,
         "-o",
         f"exp.fold={fold}",
+        "--sweep",
     ]
 
     result = subprocess.run(  # noqa: S603  (trusted project-only command)

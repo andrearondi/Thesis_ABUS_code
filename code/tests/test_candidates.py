@@ -680,3 +680,238 @@ def test_generate_ensemble_candidates_raises_without_inference_fn():
             nndet_dataset_root="/fake",
             inference_fn=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# D01.13: box-axis conversion in _raw_detections_to_candidates
+# (x1,y1,x2,y2,z1,z2) nnDetection → project BBox (min_d0,min_d1,min_d2,max_d0,max_d1,max_d2)
+# ---------------------------------------------------------------------------
+
+
+def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
+    """D01.13: _raw_detections_to_candidates maps (x1,y1,x2,y2,z1,z2) correctly.
+
+    nnDetection box axis (D01.13, nndet/core/boxes/ops.py line 34):
+      box[0]=x1, box[1]=y1, box[2]=x2, box[3]=y2, box[4]=z1, box[5]=z2
+
+    Project BBox uses storage axes (d0,d1,d2):
+      x↔d2, y↔d1, z↔d0  (EPIC_00 axis vocabulary, decisions_log C1)
+
+    So the correct mapping is:
+      min_d0 = z1 = box[4]
+      min_d1 = y1 = box[1]
+      min_d2 = x1 = box[0]
+      max_d0 = z2 = box[5]
+      max_d1 = y2 = box[3]
+      max_d2 = x2 = box[2]
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from generate_candidates import _raw_detections_to_candidates  # noqa: PLC0415
+
+    from abus.detect.nndet_inference import RawDetections
+
+    # Known box in (x1,y1,x2,y2,z1,z2): x1=10, y1=20, x2=30, y2=40, z1=5, z2=15
+    boxes = np.array([[10.0, 20.0, 30.0, 40.0, 5.0, 15.0]], dtype=np.float32)
+    scores = np.array([0.9], dtype=np.float32)
+    rd = RawDetections(case_id=42, boxes=boxes, scores=scores, embeddings=None)
+
+    candidates = _raw_detections_to_candidates(rd, split="val", source_detectors=(0,))
+
+    assert len(candidates) == 1
+    bbox = candidates[0].bbox
+    # z→d0: min_d0=z1=5, max_d0=z2=15
+    assert bbox.min_d0 == 5, f"min_d0 should be z1=5, got {bbox.min_d0}"
+    assert bbox.max_d0 == 15, f"max_d0 should be z2=15, got {bbox.max_d0}"
+    # y→d1: min_d1=y1=20, max_d1=y2=40
+    assert bbox.min_d1 == 20, f"min_d1 should be y1=20, got {bbox.min_d1}"
+    assert bbox.max_d1 == 40, f"max_d1 should be y2=40, got {bbox.max_d1}"
+    # x→d2: min_d2=x1=10, max_d2=x2=30
+    assert bbox.min_d2 == 10, f"min_d2 should be x1=10, got {bbox.min_d2}"
+    assert bbox.max_d2 == 30, f"max_d2 should be x2=30, got {bbox.max_d2}"
+
+
+def test_d01_13_train_command_includes_sweep_flag() -> None:
+    """D01.13: train_fold_detector builds the command with --sweep.
+
+    Without --sweep, plan_inference.pkl is never written (train.py:292-306),
+    so nndet_predict and predict_dir both fail. D01.13 requires retraining with
+    --sweep to produce plan_inference.pkl and sweep_predictions/.
+    """
+    import sys
+    from pathlib import Path
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from abus.detect.train import train_fold_detector
+
+    captured_cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        captured_cmds.append(list(cmd))
+
+        # Simulate successful return
+        class FakeResult:
+            returncode = 0
+            stdout = "val_metric 0.75"
+            stderr = ""
+
+        return FakeResult()
+
+    fake_ckpt = Path("/fake/model_best.ckpt")
+    with patch("abus.detect.train.subprocess.run", side_effect=fake_run):
+        with patch("abus.detect.train._locate_best_checkpoint", return_value=fake_ckpt):
+            train_fold_detector(
+                fold=0,
+                nndet_dataset_root="/fake/data",
+                out_root="/fake/models",
+            )
+
+    assert len(captured_cmds) == 1
+    cmd = captured_cmds[0]
+    assert "--sweep" in cmd, (
+        f"D01.13: nndet_train command must include --sweep to produce "
+        f"plan_inference.pkl. Got: {cmd}"
+    )
+
+
+def test_d01_13_train_command_uses_fold_override() -> None:
+    """D01.13: fold is passed as '-o exp.fold=N', not '--fold N'."""
+    import sys
+    from pathlib import Path
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from abus.detect.train import train_fold_detector
+
+    captured_cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        captured_cmds.append(list(cmd))
+
+        class FakeResult:
+            returncode = 0
+            stdout = "best 0.8"
+            stderr = ""
+
+        return FakeResult()
+
+    fake_ckpt = Path("/fake/model_best.ckpt")
+    with patch("abus.detect.train.subprocess.run", side_effect=fake_run):
+        with patch("abus.detect.train._locate_best_checkpoint", return_value=fake_ckpt):
+            train_fold_detector(fold=2, nndet_dataset_root="/fake", out_root="/fake")
+
+    cmd = captured_cmds[0]
+    assert "exp.fold=2" in " ".join(cmd), f"fold must be set via -o exp.fold=2, got {cmd}"
+    assert "--fold" not in cmd, f"--fold flag must not appear (not in nndet_train), got {cmd}"
+
+
+def test_d01_13_pruning_does_not_delete_model_last() -> None:
+    """D01.13: _prune_intermediate_checkpoints must KEEP model_last.ckpt.
+
+    model_last is the SWA checkpoint = pre-registered detector (thesis §3.2.3).
+    D01.13 finding (b): the previous pruning code deleted model_last, which
+    destroyed the pre-registered detector. model_last must be retained.
+    """
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from train_all_folds import _prune_intermediate_checkpoints  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_dir = Path(tmpdir)
+        # Create checkpoint files
+        (ckpt_dir / "model_best.ckpt").write_text("best")
+        (ckpt_dir / "model_last.ckpt").write_text("last")
+        (ckpt_dir / "epoch_050.ckpt").write_text("intermediate")
+        (ckpt_dir / "epoch_100.ckpt").write_text("intermediate")
+
+        _prune_intermediate_checkpoints(ckpt_dir)
+
+        remaining = {f.name for f in ckpt_dir.iterdir()}
+
+    assert "model_best.ckpt" in remaining, "model_best.ckpt must be kept"
+    assert "model_last.ckpt" in remaining, (
+        "D01.13: model_last.ckpt must be kept (SWA = pre-registered detector; "
+        "pruning it destroyed the inference path)"
+    )
+    assert "epoch_050.ckpt" not in remaining, "intermediate epoch_050.ckpt must be pruned"
+    assert "epoch_100.ckpt" not in remaining, "intermediate epoch_100.ckpt must be pruned"
+
+
+def test_d01_13_consolidate_uses_sweep_boxes_flag() -> None:
+    """D01.13: _run_consolidate must pass --sweep_boxes to nndet_consolidate.
+
+    D01.13 finding #5: nndet_consolidate with default '-c export' (no --sweep_boxes)
+    raises ValueError("Export needs new parameter sweep!") because it needs
+    sweep_predictions/ from each fold. consolidate.py:130-132 requires --sweep_boxes.
+    """
+    import sys
+    from pathlib import Path
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from generate_candidates import _run_consolidate  # noqa: PLC0415
+
+    captured_cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        captured_cmds.append(list(cmd))
+
+        class FakeResult:
+            returncode = 0
+
+        return FakeResult()
+
+    with patch("generate_candidates.subprocess.run", side_effect=fake_run):
+        _run_consolidate("Task001_TDSCABUS", "RetinaUNetV001_D3V001_3d")
+
+    assert len(captured_cmds) == 1
+    cmd = captured_cmds[0]
+    assert (
+        "--sweep_boxes" in cmd
+    ), f"D01.13: nndet_consolidate must include --sweep_boxes. Got: {cmd}"
+
+
+def test_d01_13_ensemble_branch_a_assigns_all_five_source_detectors() -> None:
+    """D01.13: consolidated nndet_predict -f -1 assigns source_detectors=(0,1,2,3,4).
+
+    D01.13 finding #6: consolidated output carries no per-cluster fold provenance.
+    Branch (a) assigns the full tuple (0,1,2,3,4) to every candidate — all five
+    detectors were applied. provenance_check still enforces 1≤|src|≤5, src⊆{0..4}.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from generate_candidates import _raw_detections_to_candidates  # noqa: PLC0415
+
+    from abus.detect.nndet_inference import RawDetections
+
+    boxes = np.array([[0.0, 0.0, 2.0, 2.0, 0.0, 2.0]], dtype=np.float32)
+    scores = np.array([0.8], dtype=np.float32)
+    rd = RawDetections(case_id=100, boxes=boxes, scores=scores, embeddings=None)
+
+    # Branch (a) always passes source_detectors=(0,1,2,3,4)
+    all_source_detectors: tuple[int, ...] = (0, 1, 2, 3, 4)
+    candidates = _raw_detections_to_candidates(
+        rd, split="val", source_detectors=all_source_detectors
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].source_detectors == (0, 1, 2, 3, 4)
+
+    # Must pass provenance_check
+    fold_of: dict[int, int] = {}
+    cset = RawCandidateSet(
+        split="val",
+        candidates=candidates,
+        detector_commit="test",
+        _fold_of=fold_of,
+    )
+    result = provenance_check(cset)
+    assert result["ok"] is True

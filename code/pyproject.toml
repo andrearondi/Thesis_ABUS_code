@@ -86,6 +86,25 @@ module = [
 ]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# nnDetection and omegaconf are server-only (not installed on the laptop).
+# Lazy-imported inside predict_oof; must not cause laptop mypy failures.
+module = [
+    "nndet.*",
+    "omegaconf.*",
+    "loguru.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# scripts/ are not in the package path; tests that import them via sys.path.insert
+# cannot be resolved by mypy. Suppress import-not-found for these script modules.
+module = [
+    "generate_candidates",
+    "train_all_folds",
+]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest
 # ---------------------------------------------------------------------------

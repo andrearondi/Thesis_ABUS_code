@@ -90,13 +90,18 @@ def _get_nndet_commit(nndet_dir: str | None) -> str:
 def _prune_intermediate_checkpoints(ckpt_dir: Path) -> None:
     """Remove nnDetection's intermediate periodic checkpoints.
 
-    Retains:
-      - model_best.ckpt  (best-metric)
-      - model_final.ckpt or checkpoint_final.pth  (last epoch)
+    Retains (D01.13 — both are required):
+      - model_best.ckpt  (best-metric early-stop checkpoint)
+      - model_last.ckpt  (SWA checkpoint = pre-registered detector, thesis §3.2.3)
+      - model_final.ckpt / checkpoint_final.pth  (alternative last-epoch names)
 
-    Prunes anything matching epoch_*.ckpt / checkpoint_ep*.pth patterns.
+    D01.13 fix: model_last.ckpt was previously deleted. It must be KEPT because
+    it is nnDetection's SWA model — the pre-registered "nnDetection default"
+    detector. Deleting it makes the inference path impossible without retraining.
+
+    Prunes only files whose stems do not contain any retain pattern.
     """
-    retain_patterns = {"model_best", "model_final", "checkpoint_final"}
+    retain_patterns = {"model_best", "model_last", "model_final", "checkpoint_final"}
     pruned = 0
     for ckpt_file in ckpt_dir.glob("*.ckpt"):
         if not any(pat in ckpt_file.stem for pat in retain_patterns):
