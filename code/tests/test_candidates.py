@@ -689,7 +689,7 @@ def test_generate_ensemble_candidates_raises_without_inference_fn():
 
 
 def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
-    """D01.13: _raw_detections_to_candidates maps (x1,y1,x2,y2,z1,z2) correctly.
+    """D01.13/D01.14: _raw_detections_to_candidates maps (x1,y1,x2,y2,z1,z2) correctly.
 
     nnDetection box axis (D01.13, nndet/core/boxes/ops.py line 34):
       box[0]=x1, box[1]=y1, box[2]=x2, box[3]=y2, box[4]=z1, box[5]=z2
@@ -697,13 +697,7 @@ def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
     Project BBox uses storage axes (d0,d1,d2):
       x↔d2, y↔d1, z↔d0  (EPIC_00 axis vocabulary, decisions_log C1)
 
-    So the correct mapping is:
-      min_d0 = z1 = box[4]
-      min_d1 = y1 = box[1]
-      min_d2 = x1 = box[0]
-      max_d0 = z2 = box[5]
-      max_d1 = y2 = box[3]
-      max_d2 = x2 = box[2]
+    D01.14: uses RawDetectionsWithEmb (real embeddings required; zero-placeholder retired).
     """
     import sys
     from pathlib import Path
@@ -711,12 +705,13 @@ def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     from generate_candidates import _raw_detections_to_candidates  # noqa: PLC0415
 
-    from abus.detect.nndet_inference import RawDetections
+    from abus.detect.nndet_inference import D_EMB, RawDetectionsWithEmb
 
     # Known box in (x1,y1,x2,y2,z1,z2): x1=10, y1=20, x2=30, y2=40, z1=5, z2=15
     boxes = np.array([[10.0, 20.0, 30.0, 40.0, 5.0, 15.0]], dtype=np.float32)
     scores = np.array([0.9], dtype=np.float32)
-    rd = RawDetections(case_id=42, boxes=boxes, scores=scores, embeddings=None)
+    embeddings = np.zeros((1, D_EMB), dtype=np.float32)
+    rd = RawDetectionsWithEmb(case_id=42, boxes=boxes, scores=scores, embeddings=embeddings)
 
     candidates = _raw_detections_to_candidates(rd, split="val", source_detectors=(0,))
 
@@ -877,12 +872,51 @@ def test_d01_13_consolidate_uses_sweep_boxes_flag() -> None:
     ), f"D01.13: nndet_consolidate must include --sweep_boxes. Got: {cmd}"
 
 
-def test_d01_13_ensemble_branch_a_assigns_all_five_source_detectors() -> None:
-    """D01.13: consolidated nndet_predict -f -1 assigns source_detectors=(0,1,2,3,4).
+def test_d01_14_d_emb_is_128_in_generate_candidates() -> None:
+    """D01.14: D_EMB=128 constant is used in generate_candidates._raw_detections_to_candidates.
 
-    D01.13 finding #6: consolidated output carries no per-cluster fold provenance.
-    Branch (a) assigns the full tuple (0,1,2,3,4) to every candidate — all five
-    detectors were applied. provenance_check still enforces 1≤|src|≤5, src⊆{0..4}.
+    The zero-placeholder of shape (1,) from D01.13 is replaced by asserting
+    RawDetectionsWithEmb.embeddings shape matches (N, D_EMB) and each candidate
+    gets an embedding of shape (128,).
+
+    This test verifies that _raw_detections_to_candidates produces embedding
+    shape (128,) when given a RawDetectionsWithEmb with real embeddings — NOT
+    the old (1,) zero-placeholder.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from generate_candidates import _raw_detections_to_candidates  # noqa: PLC0415
+
+    from abus.detect.nndet_inference import D_EMB, RawDetectionsWithEmb
+
+    boxes = np.array([[0.0, 0.0, 2.0, 2.0, 0.0, 2.0]], dtype=np.float32)
+    scores = np.array([0.8], dtype=np.float32)
+    real_emb = np.random.randn(1, D_EMB).astype(np.float32)
+
+    rd = RawDetectionsWithEmb(case_id=5, boxes=boxes, scores=scores, embeddings=real_emb)
+
+    candidates = _raw_detections_to_candidates(rd, split="train", source_detectors=(2,))
+    assert len(candidates) == 1
+    emb = candidates[0].embedding
+    assert emb.shape == (D_EMB,), f"Expected (128,), got {emb.shape}"
+    assert emb.dtype == np.float32, f"Expected float32, got {emb.dtype}"
+    # Must be the REAL embedding, not zeros
+    np.testing.assert_allclose(
+        emb,
+        real_emb[0],
+        rtol=1e-5,
+        err_msg="candidate.embedding must come from RawDetectionsWithEmb, not zeros",
+    )
+
+
+def test_d01_14_raw_detections_to_candidates_rejects_none_embedding() -> None:
+    """D01.14: _raw_detections_to_candidates raises when embeddings is None.
+
+    Post-D01.14, the zero-placeholder is removed. Passing RawDetections (embeddings=None)
+    to _raw_detections_to_candidates should raise an error, not silently produce
+    zero-vector embeddings of shape (1,).
     """
     import sys
     from pathlib import Path
@@ -894,18 +928,46 @@ def test_d01_13_ensemble_branch_a_assigns_all_five_source_detectors() -> None:
 
     boxes = np.array([[0.0, 0.0, 2.0, 2.0, 0.0, 2.0]], dtype=np.float32)
     scores = np.array([0.8], dtype=np.float32)
-    rd = RawDetections(case_id=100, boxes=boxes, scores=scores, embeddings=None)
+    rd = RawDetections(case_id=5, boxes=boxes, scores=scores, embeddings=None)
 
-    # Branch (a) always passes source_detectors=(0,1,2,3,4)
-    all_source_detectors: tuple[int, ...] = (0, 1, 2, 3, 4)
-    candidates = _raw_detections_to_candidates(
-        rd, split="val", source_detectors=all_source_detectors
-    )
+    with pytest.raises((ValueError, TypeError, AssertionError)):
+        _raw_detections_to_candidates(rd, split="train", source_detectors=(0,))
+
+
+def test_d01_14_ensemble_per_fold_wrapper_assigns_genuine_source_detectors() -> None:
+    """D01.14 supersedes D01.13 branch-(a): per-fold predict_with_embeddings produces
+    genuine 1..5 source_detectors (not blanket (0,1,2,3,4)).
+
+    D01.14 point 4: branch (a) is abandoned. Both OOF and val/test now use
+    predict_with_embeddings. For val/test, ensemble_combine assigns source_detectors
+    from the per-fold contributions that survive each cluster.
+
+    This test verifies that _raw_detections_to_candidates (called with per-fold
+    source_detectors) produces correct provenance when given RawDetectionsWithEmb.
+    """
+
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from generate_candidates import _raw_detections_to_candidates  # noqa: PLC0415
+
+    from abus.detect.nndet_inference import D_EMB, RawDetectionsWithEmb
+
+    boxes = np.array([[0.0, 0.0, 2.0, 2.0, 0.0, 2.0]], dtype=np.float32)
+    scores = np.array([0.8], dtype=np.float32)
+    embeddings = np.random.randn(1, D_EMB).astype(np.float32)
+    rd = RawDetectionsWithEmb(case_id=100, boxes=boxes, scores=scores, embeddings=embeddings)
+
+    # Per-fold wrapper uses single fold's source_detectors
+    fold_source: tuple[int, ...] = (2,)
+    candidates = _raw_detections_to_candidates(rd, split="val", source_detectors=fold_source)
 
     assert len(candidates) == 1
-    assert candidates[0].source_detectors == (0, 1, 2, 3, 4)
+    assert candidates[0].source_detectors == (2,)
+    assert candidates[0].embedding.shape == (D_EMB,)
 
-    # Must pass provenance_check
+    # Must pass provenance_check (val: 1..5 detectors, all in {0..4})
     fold_of: dict[int, int] = {}
     cset = RawCandidateSet(
         split="val",
@@ -915,3 +977,281 @@ def test_d01_13_ensemble_branch_a_assigns_all_five_source_detectors() -> None:
     )
     result = provenance_check(cset)
     assert result["ok"] is True
+
+
+# ===========================================================================
+# D01.14b — val/test preprocessing fix (2026-06-04)
+# ===========================================================================
+
+
+def test_d01_14b_val_test_ensemble_uses_images_ts_not_images_tr() -> None:
+    """D01.14b: _generate_ensemble_with_embeddings passes imagesTs to predict_with_embeddings.
+
+    Root cause of the confirmed correctness gap (verified 2026-06-04):
+      preprocessed/D3V001_3d/imagesTr/ contains ONLY 100 training cases (0000-0099).
+      val/test cases (0100-0199) are NOT there. They are in raw_splitted/imagesTs/ (raw)
+      and must be preprocessed into preprocessed/D3V001_3d/imagesTs/ first.
+
+    D01.14 (wrong): val/test path pointed to imagesTr -> predict_with_embeddings finds
+    no .npz for 0100+ -> silently produces ZERO val/test candidates.
+    D01.14b (correct): val/test path must point to imagesTs (after run_preprocessing_test).
+
+    This test verifies that when main() is invoked with --splits val,
+    the preprocessed_ts_dir argument forwarded to _generate_ensemble_with_embeddings
+    uses imagesTs, NOT imagesTr.
+    """
+    import sys
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import generate_candidates  # noqa: PLC0415
+
+    captured_preprocessed_dirs: list[str] = []
+
+    def capturing_generate_ensemble(
+        det_models_root: str,
+        task_name: str,
+        exp_id: str,
+        split_case_ids: dict[str, list[int]],
+        preprocessed_ts_dir: str,
+        nndet_commit: str,
+    ) -> object:
+        captured_preprocessed_dirs.append(preprocessed_ts_dir)
+        return {}
+
+    with (
+        patch.object(
+            generate_candidates,
+            "_generate_ensemble_with_embeddings",
+            capturing_generate_ensemble,
+        ),
+        patch.object(generate_candidates, "preprocess_val_test", MagicMock(return_value=None)),
+        patch.object(generate_candidates, "generate_oof_candidates", MagicMock(return_value=[])),
+        patch.object(
+            generate_candidates,
+            "load_split",
+            MagicMock(
+                return_value=MagicMock(
+                    fold_of={i: (i % 5) for i in range(100)},
+                    oof_ids=lambda f: list(range(f * 20, (f + 1) * 20)),
+                )
+            ),
+        ),
+    ):
+        import sys as _sys
+
+        old_argv = _sys.argv
+        try:
+            with tempfile.TemporaryDirectory() as out_dir:
+                _sys.argv = [
+                    "generate_candidates.py",
+                    "--det-data",
+                    "/fake/det_data",
+                    "--det-models",
+                    "/fake/det_models",
+                    "--out-dir",
+                    out_dir,
+                    "--splits",
+                    "val",
+                ]
+                try:
+                    generate_candidates.main()
+                except (SystemExit, Exception):
+                    pass
+        finally:
+            _sys.argv = old_argv
+
+    # If captured, verify the dir contains "imagesTs" not "imagesTr"
+    assert captured_preprocessed_dirs, (
+        "_generate_ensemble_with_embeddings was not called — "
+        "main() did not invoke the val/test ensemble path"
+    )
+    for captured_dir in captured_preprocessed_dirs:
+        assert "imagesTs" in captured_dir, (
+            f"D01.14b: val/test ensemble must use imagesTs (not imagesTr). "
+            f"Got preprocessed_ts_dir={captured_dir!r}. "
+            "D01.14b fix: val/test cases are in imagesTs after run_preprocessing_test."
+        )
+        assert "imagesTr" not in captured_dir, (
+            f"D01.14b: val/test ensemble must NOT use imagesTr. "
+            f"imagesTr contains only training cases (0000-0099). "
+            f"Got preprocessed_ts_dir={captured_dir!r}."
+        )
+
+
+def test_d01_14b_oof_branch_still_uses_images_tr() -> None:
+    """D01.14b: OOF (train split) branch still uses imagesTr — unchanged by the fix.
+
+    The OOF path (100 training cases, preprocessed by nndet_prep into imagesTr)
+    must remain pointed at imagesTr. This test guards against accidentally breaking
+    the OOF path when fixing the val/test path.
+    """
+    import sys
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import generate_candidates  # noqa: PLC0415
+
+    captured_oof_preprocessed_dirs: list[str] = []
+
+    def capturing_make_oof(
+        fold: int,
+        preprocessed_dir: str,
+        fold_dir: str,
+    ) -> object:
+        captured_oof_preprocessed_dirs.append(preprocessed_dir)
+        return lambda case_ids: []
+
+    with (
+        patch.object(generate_candidates, "_make_oof_inference_fn", capturing_make_oof),
+        patch.object(generate_candidates, "generate_oof_candidates", MagicMock(return_value=[])),
+        patch.object(
+            generate_candidates,
+            "_generate_ensemble_with_embeddings",
+            MagicMock(return_value={}),
+        ),
+        patch.object(generate_candidates, "preprocess_val_test", MagicMock(return_value=None)),
+        patch.object(
+            generate_candidates,
+            "load_split",
+            MagicMock(
+                return_value=MagicMock(
+                    fold_of={i: (i % 5) for i in range(100)},
+                    oof_ids=lambda f: list(range(f * 20, (f + 1) * 20)),
+                )
+            ),
+        ),
+    ):
+        import sys as _sys
+
+        old_argv = _sys.argv
+        try:
+            with tempfile.TemporaryDirectory() as out_dir:
+                _sys.argv = [
+                    "generate_candidates.py",
+                    "--det-data",
+                    "/fake/det_data",
+                    "--det-models",
+                    "/fake/det_models",
+                    "--out-dir",
+                    out_dir,
+                    "--splits",
+                    "train",
+                ]
+                try:
+                    generate_candidates.main()
+                except (SystemExit, Exception):
+                    pass
+        finally:
+            _sys.argv = old_argv
+
+    assert (
+        captured_oof_preprocessed_dirs
+    ), "_make_oof_inference_fn was not called — main() did not invoke the OOF path"
+    for captured_dir in captured_oof_preprocessed_dirs:
+        assert "imagesTr" in captured_dir, (
+            f"D01.14b: OOF (train split) must use imagesTr. "
+            f"Training cases 0000-0099 are preprocessed there by nndet_prep. "
+            f"Got preprocessed_dir={captured_dir!r}."
+        )
+
+
+def test_d01_14b_val_test_case_ids_are_held_out_set() -> None:
+    """D01.14b: val/test case_ids passed to _generate_ensemble_with_embeddings
+    are the held-out set (val=100..129, test=130..199) — NOT any training case.
+    """
+    import sys
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import generate_candidates  # noqa: PLC0415
+
+    captured_split_case_ids: list[dict[str, list[int]]] = []
+
+    def capturing_generate_ensemble(
+        det_models_root: str,
+        task_name: str,
+        exp_id: str,
+        split_case_ids: dict[str, list[int]],
+        preprocessed_ts_dir: str,
+        nndet_commit: str,
+    ) -> object:
+        captured_split_case_ids.append(split_case_ids)
+        return {}
+
+    with (
+        patch.object(
+            generate_candidates,
+            "_generate_ensemble_with_embeddings",
+            capturing_generate_ensemble,
+        ),
+        patch.object(generate_candidates, "preprocess_val_test", MagicMock(return_value=None)),
+        patch.object(generate_candidates, "generate_oof_candidates", MagicMock(return_value=[])),
+        patch.object(
+            generate_candidates,
+            "load_split",
+            MagicMock(
+                return_value=MagicMock(
+                    fold_of={i: (i % 5) for i in range(100)},
+                    oof_ids=lambda f: list(range(f * 20, (f + 1) * 20)),
+                )
+            ),
+        ),
+    ):
+        import sys as _sys
+
+        old_argv = _sys.argv
+        try:
+            with tempfile.TemporaryDirectory() as out_dir:
+                _sys.argv = [
+                    "generate_candidates.py",
+                    "--det-data",
+                    "/fake/det_data",
+                    "--det-models",
+                    "/fake/det_models",
+                    "--out-dir",
+                    out_dir,
+                    "--splits",
+                    "val",
+                    "test",
+                ]
+                try:
+                    generate_candidates.main()
+                except (SystemExit, Exception):
+                    pass
+        finally:
+            _sys.argv = old_argv
+
+    assert captured_split_case_ids, "_generate_ensemble_with_embeddings was not called"
+
+    split_ids = captured_split_case_ids[0]
+
+    if "val" in split_ids:
+        val_ids = sorted(split_ids["val"])
+        assert val_ids == list(range(100, 130)), (
+            f"D01.14b: val case_ids must be 100..129 (held-out val split). "
+            f"Got first/last: {val_ids[:3]}...{val_ids[-3:]} (len={len(val_ids)})"
+        )
+        training_ids_in_val = [cid for cid in val_ids if cid < 100]
+        assert not training_ids_in_val, (
+            f"D01.14b: val case_ids must not include training cases. "
+            f"Found training cases in val: {training_ids_in_val}"
+        )
+
+    if "test" in split_ids:
+        test_ids = sorted(split_ids["test"])
+        assert test_ids == list(range(130, 200)), (
+            f"D01.14b: test case_ids must be 130..199 (held-out test split). "
+            f"Got first/last: {test_ids[:3]}...{test_ids[-3:]} (len={len(test_ids)})"
+        )
+        training_ids_in_test = [cid for cid in test_ids if cid < 100]
+        assert not training_ids_in_test, (
+            f"D01.14b: test case_ids must not include training cases. "
+            f"Found: {training_ids_in_test}"
+        )

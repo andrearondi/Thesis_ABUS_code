@@ -1,0 +1,62 @@
+# Frozen backbone-embedding extraction configuration (D01.14, 2026-06-04)
+#
+# This config is FROZEN. Any change requires a new decision-log entry and a
+# re-run of all candidate generation jobs, since the embedding is the principal
+# GNN node feature and changes it downstream to the graph, GNN training, and
+# all pre-registered hypothesis tests (H1/H2/H3).
+#
+# Recorded in every RawCandidateSet for reproducibility (agent_rules §12).
+#
+# Source grounding: nnDetection 0.1 commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5
+#   - Hook target: model.decoder  (retina.py:219 — features_maps_all = self.decoder(...))
+#   - FPN output: list of tensors [C, D0, D1, D2] per level
+#   - fpn_channels: 128  (build log "fpn channels: 128"; base.py:528)
+#   - decoder_levels: read from plan_arch["decoder_levels"] at inference time
+#   - Level index 0: decoder_levels[0] = finest detection FPN level (largest spatial res)
+
+# Pinned embedding dimension (fpn_channels = 128)
+d_emb: 128
+
+# Hook target module attribute path on the loaded model object
+hook_target: "decoder"
+
+# Which element of features_maps_all to pool from (0 = finest detection FPN level)
+# decoder_levels[0] is the finest level, giving the least-lossy point sample.
+fpn_level_index: 0
+
+# Pooling method: point-at-centroid trilinear interpolation
+# Implements thesis §3.2.3 "default pooled embedding"
+# The §3.2.3 contingency (RoI-Align) is NOT implemented here; it is invoked only
+# if STORY_01_04's embedding_discriminativeness shows embedding_auc ≤ confidence_auc.
+pooling_method: "point"
+interpolation: "trilinear"
+
+# Coordinate mapping (D01.14, D01.13, D01.7, EPIC_00 C1):
+#   nnDetection box axis: (x1, y1, x2, y2, z1, z2)
+#     where x = storage axis d2 (elevational, 0.500 mm after D01.7)
+#           y = storage axis d1 (lateral,    0.300 mm after D01.7)
+#           z = storage axis d0 (acoustic depth, 0.300 mm after D01.7)
+#   Feature map tensor axes: [C, d0, d1, d2]
+#   Centroid → feature map axes:
+#     cx_d0 = (z1 + z2) / 2   → tensor axis 1
+#     cx_d1 = (y1 + y2) / 2   → tensor axis 2
+#     cx_d2 = (x1 + x2) / 2   → tensor axis 3
+box_axis: "(x1, y1, x2, y2, z1, z2)"
+tta_frame_note: >
+  The hook fires per tile per TTA pass (in tile-pixel space). Box centroid
+  is adjusted to tile-local space by subtracting tile_origin before pooling.
+  See predict_with_embeddings in nndet_inference.py for the full implementation.
+
+# TTA (test-time augmentation): nnDetection 0.1 default (4 transforms)
+# The TTA inverse is applied to box coordinates by nnDetection before we receive them.
+# Embeddings are pooled from the per-tile feature map in tile space, consistent with
+# the box coordinates in that tile's frame.
+num_tta_transforms: 4
+
+# Detector checkpoint: SWA model_last (pre-registered default per thesis §3.2.3)
+# load_final_model(identifier="last") — loading.py:64
+checkpoint_identifier: "last"
+
+# nnDetection version pinned for reproducibility (agent_rules §12)
+nndet_commit: "97a58f3110b71caf1b4bcc1851e67cf11e987fc5"
+nndet_version: "0.1"
