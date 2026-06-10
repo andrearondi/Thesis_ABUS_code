@@ -217,7 +217,12 @@ def make_fold_split(
     df = df.sort_values("case_id").reset_index(drop=True)
     case_ids = df["case_id"].astype(int).tolist()
     labels = df["label"].astype(str).tolist()
-    label_of: dict[int, str] = dict(zip(case_ids, labels, strict=True))
+    # Preserve the strict length-equality guarantee without zip(strict=True), which
+    # is Python 3.10+ and crashes in the server's nndet env (Python 3.8). See
+    # scripts/check_py38_compat.py.
+    if len(case_ids) != len(labels):
+        raise ValueError(f"case_ids and labels length mismatch: {len(case_ids)} vs {len(labels)}.")
+    label_of: dict[int, str] = dict(zip(case_ids, labels))  # noqa: B905 (py38: no strict=)
 
     # StratifiedKFold — shuffle=True is required for random_state to take effect
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)

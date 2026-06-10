@@ -36,6 +36,7 @@ done
 
 RUFF_STATUS=0
 BLACK_STATUS=0
+PY38_STATUS=0
 MYPY_STATUS=0
 PYTEST_STATUS=0
 
@@ -44,6 +45,8 @@ if $RUN_LINT; then
     ruff check src tests scripts || RUFF_STATUS=$?
     echo "==> black --check ..."
     black --check src tests scripts || BLACK_STATUS=$?
+    echo "==> py38 compat (nndet-env modules run on Python 3.8) ..."
+    python scripts/check_py38_compat.py || PY38_STATUS=$?
 fi
 
 if $RUN_TYPES; then
@@ -61,13 +64,15 @@ echo "========================================"
 
 ruff_label="OK"
 black_label="clean"
+py38_label="3.8-safe"
 mypy_label="0 errors"
 pytest_label="passed"
 
 if $RUN_LINT; then
     [ $RUFF_STATUS -ne 0 ] && ruff_label="FAILED (${RUFF_STATUS})"
     [ $BLACK_STATUS -ne 0 ] && black_label="FAILED (${BLACK_STATUS})"
-    echo "ruff:  ${ruff_label} | black: ${black_label}"
+    [ $PY38_STATUS -ne 0 ] && py38_label="FAILED (${PY38_STATUS})"
+    echo "ruff:  ${ruff_label} | black: ${black_label} | py38: ${py38_label}"
 fi
 if $RUN_TYPES; then
     [ $MYPY_STATUS -ne 0 ] && mypy_label="FAILED (${MYPY_STATUS})"
@@ -80,7 +85,7 @@ fi
 
 echo "========================================"
 
-OVERALL=$((RUFF_STATUS + BLACK_STATUS + MYPY_STATUS + PYTEST_STATUS))
+OVERALL=$((RUFF_STATUS + BLACK_STATUS + PY38_STATUS + MYPY_STATUS + PYTEST_STATUS))
 if [ $OVERALL -ne 0 ]; then
     echo "GATE: FAILED"
     exit 1

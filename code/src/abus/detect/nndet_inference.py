@@ -568,14 +568,16 @@ def _predict_single_case_with_embeddings(
 
     all_proposals: list[RawCandidate] = []
 
-    for tile_idx, (tile, feat_map_raw, tile_boxes, tile_scores) in enumerate(
-        zip(tiles, feat_maps_per_tile, boxes_per_tile, scores_per_tile, strict=False)
-    ):
+    # NOTE: no zip(strict=) — that kwarg is Python 3.10+, and this module runs in the
+    # server's nndet env (Python 3.8). Default zip() truncates to the shortest iterable,
+    # which matches the intended strict=False semantics here. See check_py38_compat.py.
+    tile_iter = zip(tiles, feat_maps_per_tile, boxes_per_tile, scores_per_tile)  # noqa: B905
+    for tile_idx, (tile, feat_map_raw, tile_boxes, tile_scores) in enumerate(tile_iter):
         if tile_boxes.shape[0] == 0:
             continue
 
         # Extract the feature map for the specified FPN level.
-        if isinstance(feat_map_raw, list | tuple):
+        if isinstance(feat_map_raw, (list, tuple)):  # noqa: UP038 (py38: no X|Y in isinstance)
             if fpn_level_index >= len(feat_map_raw):
                 logger.warning(
                     "_predict_single_case_with_embeddings: tile %d: fpn_level_index=%d "
@@ -823,7 +825,7 @@ def predict_with_embeddings(
 
     def _decoder_hook(module: object, input: object, output: object) -> None:  # noqa: A002
         """Capture FPN feature maps per tile forward call."""
-        if isinstance(output, list | tuple):
+        if isinstance(output, (list, tuple)):  # noqa: UP038 (py38: no X|Y in isinstance)
             captured = [
                 np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t) for t in output
             ]
@@ -832,12 +834,25 @@ def predict_with_embeddings(
             captured = [arr]
         _tile_feat_maps.append(captured)
 
-    if hasattr(model, "decoder"):
-        _hook_handle = model.decoder.register_forward_hook(_decoder_hook)
+    # nnDetection's loaded object is the Lightning module (RetinaUNetModule), whose
+    # actual network is at `.model` (base_module.py: self.model = from_config_plan(...))
+    # and whose decoder is `network.decoder` (retina.py: self.decoder = decoder).
+    # So the decoder is at `model.model.decoder`, NOT `model.decoder`. Resolve the
+    # inner network first, then fall back to the top-level object for robustness
+    # across nnDetection versions. Getting this wrong yields all-zero embeddings.
+    _decoder_module = None
+    _inner = getattr(model, "model", None)
+    if _inner is not None and hasattr(_inner, "decoder"):
+        _decoder_module = _inner.decoder
+    elif hasattr(model, "decoder"):
+        _decoder_module = model.decoder
+
+    if _decoder_module is not None:
+        _hook_handle = _decoder_module.register_forward_hook(_decoder_hook)
     else:
         logger.warning(
-            "predict_with_embeddings: model has no .decoder attribute; "
-            "embeddings will be zeros. Check nnDetection version."
+            "predict_with_embeddings: could not locate a .decoder attribute on "
+            "model.model or model; embeddings will be zeros. Check nnDetection version."
         )
         _hook_handle = None
 
@@ -920,7 +935,7 @@ def predict_with_embeddings(
                         feat_maps_per_tile.append(_tile_feat_maps[-1])
                         _tile_feat_maps.clear()
                     else:
-                        # No hook capture (model has no .decoder) — use empty
+                        # No hook capture (decoder hook not attached) — use empty
                         feat_maps_per_tile.append([])
 
                     # Extract per-tile boxes/scores (list with one element for batch_size=1)
