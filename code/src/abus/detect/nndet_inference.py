@@ -39,6 +39,12 @@ Public objects:
     real (N, 128) embeddings. Requires the nnDetection conda env (server-only).
     Lazy imports.
 
+    OOM fix (D01.14-OOM, 2026-06-20): streaming per-tile pooling.  The hook
+    now retains only the level-0 (finest) feature map; pooling happens
+    immediately after each tile's forward pass so that the tile's feature map
+    is released before the next tile begins.  Peak host-RAM is bounded to
+    ~1 tile's worth of level-0 feature map rather than all tiles simultaneously.
+
   preprocess_val_test(fold_dir, num_processes) -> None
     D01.14b val/test preprocessing step. Runs the nnDetection planner's
     run_preprocessing_test to populate preprocessed/<data_identifier>/imagesTs/
@@ -560,10 +566,9 @@ def _predict_single_case_with_embeddings(
     scores : np.ndarray shape (N,) float32
     embeddings : np.ndarray shape (N, D_EMB) float32
     """
-    # Import ensemble_combine lazily to avoid circular imports at module load time.
+    # Import lazily to avoid circular imports at module load time.
     # (This module is imported by generate_candidates.py which imports from ensemble.py.)
     from abus.detect.candidates import RawCandidate
-    from abus.detect.ensemble import ensemble_combine
     from abus.geometry.bbox import BBox
 
     all_proposals: list[RawCandidate] = []
@@ -649,11 +654,52 @@ def _predict_single_case_with_embeddings(
                 )
             )
 
+    # WBC across all tiles via the shared helper (eliminates duplication and keeps
+    # iou_threshold consistent between batch and streaming paths).
+    # _ensemble_proposals_to_arrays is defined later in this module; Python resolves
+    # function references at call time so forward definition is fine.
+    return _ensemble_proposals_to_arrays(all_proposals, iou_threshold=iou_threshold)
+
+
+# ---------------------------------------------------------------------------
+# _ensemble_proposals_to_arrays  (D01.14-OOM — WBC + array packing)
+# ---------------------------------------------------------------------------
+
+
+def _ensemble_proposals_to_arrays(
+    all_proposals: list,
+    iou_threshold: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """WBC ensemble a list of RawCandidate proposals and return (boxes, scores, embeddings).
+
+    D01.14-OOM streaming fix: this is the second half of what
+    ``_predict_single_case_with_embeddings`` does (WBC + array packing).
+    Factored out so the streaming path in ``predict_with_embeddings`` can pass
+    already-pooled proposals directly without re-materialising per-tile feature
+    maps.
+
+    Parameters
+    ----------
+    all_proposals : list[RawCandidate]
+        Proposals for one case, already pooled at tile-LOCAL centroids and
+        shifted to case-space (produced by repeated calls to
+        ``_pool_tile_proposals``).
+    iou_threshold : float
+        IoU threshold for WBC. Default 0.5 (provisional; STORY_01_03 wires a
+        calibrated project-wide threshold).
+
+    Returns
+    -------
+    boxes : np.ndarray  shape (N, 6) float32, case-preprocessed-space
+    scores : np.ndarray shape (N,) float32
+    embeddings : np.ndarray shape (N, D_EMB) float32
+    """
+    from abus.detect.ensemble import ensemble_combine
+
     if not all_proposals:
         empty = np.zeros((0, 6), dtype=np.float32)
         return empty, np.zeros(0, dtype=np.float32), np.zeros((0, D_EMB), dtype=np.float32)
 
-    # WBC across all tiles: union → IoU-cluster → score+embedding averaging
     combined = ensemble_combine(all_proposals, iou_threshold=iou_threshold)
 
     n = len(combined)
@@ -669,6 +715,135 @@ def _predict_single_case_with_embeddings(
         embeddings_out[i] = c.embedding.astype(np.float32)
 
     return boxes_out, scores_out, embeddings_out
+
+
+# ---------------------------------------------------------------------------
+# _pool_tile_proposals  (D01.14-OOM — CPU-safe streaming helper)
+# ---------------------------------------------------------------------------
+
+
+def _pool_tile_proposals(
+    feat_map_raw: object,
+    tile_boxes: np.ndarray,
+    tile_scores: np.ndarray,
+    tile_origin: tuple,
+    fpn_level_index: int = 0,
+    tile_idx: int = 0,
+) -> list:
+    """Pool embeddings for one tile and return a list of RawCandidate proposals.
+
+    D01.14-OOM streaming fix: called immediately after each tile's forward pass so
+    the feature map can be released before the next tile runs.  Only the tiny
+    per-tile (bbox, score, embedding) records accumulate across tiles.
+
+    Semantics are IDENTICAL to the per-tile loop body inside
+    ``_predict_single_case_with_embeddings`` — this is a factored-out version of
+    that loop body so it can be called in the streaming path AND so the existing
+    ``_predict_single_case_with_embeddings`` interface (used by unit tests) is
+    preserved unchanged.
+
+    Parameters
+    ----------
+    feat_map_raw : list[np.ndarray] | np.ndarray
+        Raw feature map from the decoder hook for this tile.
+        If a list/tuple, index ``fpn_level_index`` selects the FPN level.
+    tile_boxes : np.ndarray
+        Per-tile detected boxes in tile-LOCAL pixel space, shape (N, 6) float32,
+        axis (x1, y1, x2, y2, z1, z2).
+    tile_scores : np.ndarray
+        Per-tile detection scores, shape (N,) float32.
+    tile_origin : tuple
+        Tile origin in nnDetection (x, y, z) = (d2, d1, d0) order.
+    fpn_level_index : int
+        FPN level to pool from (default 0 = finest).
+    tile_idx : int
+        Tile index for logging only.
+
+    Returns
+    -------
+    list[RawCandidate]
+        Zero or more proposals for this tile, with embeddings pooled at
+        tile-LOCAL centroids and boxes shifted to case-space by tile_origin.
+    """
+    from abus.detect.candidates import RawCandidate
+    from abus.geometry.bbox import BBox
+
+    if tile_boxes.shape[0] == 0:
+        return []
+
+    # Extract the FPN level requested.
+    if isinstance(feat_map_raw, (list, tuple)):  # noqa: UP038 (py38: no X|Y in isinstance)
+        if fpn_level_index >= len(feat_map_raw):
+            logger.warning(
+                "_pool_tile_proposals: tile %d: fpn_level_index=%d out of range "
+                "(%d levels); skipping tile embeddings",
+                tile_idx,
+                fpn_level_index,
+                len(feat_map_raw),
+            )
+            return []
+        feat_map: np.ndarray = np.asarray(feat_map_raw[fpn_level_index])
+    else:
+        feat_map = np.asarray(feat_map_raw)
+
+    # Remove batch dim if present: (B, C, D0, D1, D2) → (C, D0, D1, D2)
+    if feat_map.ndim == 5:
+        feat_map = feat_map[0]
+
+    # tile_origin in nnDetection (x, y, z) order = (d2, d1, d0).
+    # _apply_offsets_to_boxes convention (detection.py:242-249):
+    #   boxes[:,0] += offset[0]   (x1 → d2_min)
+    #   boxes[:,1] += offset[1]   (y1 → d1_min)
+    #   boxes[:,2] += offset[0]   (x2 → d2_max)
+    #   boxes[:,3] += offset[1]   (y2 → d1_max)
+    #   boxes[:,4] += offset[2]   (z1 → d0_min)
+    #   boxes[:,5] += offset[2]   (z2 → d0_max)
+    x_offset = float(tile_origin[0])  # d2
+    y_offset = float(tile_origin[1])  # d1
+    z_offset = float(tile_origin[2])  # d0
+
+    proposals = []
+    for i in range(tile_boxes.shape[0]):
+        box_tile = tile_boxes[i]  # tile-local (x1, y1, x2, y2, z1, z2)
+
+        # Pool at tile-LOCAL centroid — CORRECT: feat_map and box are both in tile space.
+        cx_x = (box_tile[0] + box_tile[2]) / 2.0  # d2 in tile space
+        cx_y = (box_tile[1] + box_tile[3]) / 2.0  # d1 in tile space
+        cx_z = (box_tile[4] + box_tile[5]) / 2.0  # d0 in tile space
+
+        emb = point_pool_trilinear(feat_map, cx_d0=cx_z, cx_d1=cx_y, cx_d2=cx_x)
+
+        # Apply tile_origin offset → case-space box.
+        x1_case = box_tile[0] + x_offset
+        y1_case = box_tile[1] + y_offset
+        x2_case = box_tile[2] + x_offset
+        y2_case = box_tile[3] + y_offset
+        z1_case = box_tile[4] + z_offset
+        z2_case = box_tile[5] + z_offset
+
+        # Map (x1,y1,x2,y2,z1,z2) → project BBox (min_d0,min_d1,min_d2,max_d0,max_d1,max_d2)
+        # x=d2, y=d1, z=d0
+        bbox = BBox(
+            min_d0=int(round(float(z1_case))),
+            min_d1=int(round(float(y1_case))),
+            min_d2=int(round(float(x1_case))),
+            max_d0=max(int(round(float(z2_case))), int(round(float(z1_case))) + 1),
+            max_d1=max(int(round(float(y2_case))), int(round(float(y1_case))) + 1),
+            max_d2=max(int(round(float(x2_case))), int(round(float(x1_case))) + 1),
+        )
+
+        proposals.append(
+            RawCandidate(
+                case_id=0,  # placeholder — caller replaces
+                split="ens_tmp",
+                bbox=bbox,
+                score=float(tile_scores[i]),
+                embedding=emb,
+                source_detectors=(0,),  # placeholder — caller replaces
+            )
+        )
+
+    return proposals
 
 
 # ---------------------------------------------------------------------------
@@ -826,22 +1001,31 @@ def predict_with_embeddings(
         fold_dir,
     )
 
-    # --- Hook setup ---
-    # Captures the FPN feature map list (features_maps_all) from model.decoder
-    # output during each tile forward pass. The hook fires ONCE per forward call,
-    # in tile-local pixel space — before any tile_origin offset or restore.
-    _tile_feat_maps: list[list[np.ndarray]] = []  # per forward call
+    # --- Hook setup (D01.14-OOM streaming fix) ---
+    # The hook now captures ONLY the level-0 (finest) FPN feature map immediately
+    # as a CPU numpy array, discarding all other levels.  This eliminates the
+    # multi-level tensor accumulation that was the dominant source of host RAM
+    # usage (levels 1-3 are never used downstream; only level 0 is pooled).
+    #
+    # _tile_feat_maps holds at most ONE entry at a time: the level-0 array from
+    # the most recent forward call.  It is cleared immediately after pooling so
+    # the memory is released before the next tile runs.
+    _tile_feat_maps: list[np.ndarray] = []  # at most one entry between clears
 
     def _decoder_hook(module: object, input: object, output: object) -> None:  # noqa: A002
-        """Capture FPN feature maps per tile forward call."""
+        """Capture only the level-0 FPN feature map per tile forward call.
+
+        D01.14-OOM fix: retain only the finest level (index 0) as a numpy array;
+        discard levels 1-3 immediately so their GPU/CPU tensors can be freed.
+        """
         if isinstance(output, (list, tuple)):  # noqa: UP038 (py38: no X|Y in isinstance)
-            captured = [
-                np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t) for t in output
-            ]
+            if len(output) == 0:
+                return
+            t = output[fpn_level_index] if fpn_level_index < len(output) else output[0]
+            arr = np.asarray(t.detach().cpu().numpy() if hasattr(t, "detach") else t)
         else:
-            arr = output.detach().cpu().numpy() if hasattr(output, "detach") else np.array(output)
-            captured = [arr]
-        _tile_feat_maps.append(captured)
+            arr = np.asarray(output.detach().cpu().numpy() if hasattr(output, "detach") else output)
+        _tile_feat_maps.append(arr)
 
     # nnDetection's loaded object is the Lightning module (RetinaUNetModule), whose
     # actual network is at `.model` (base_module.py: self.model = from_config_plan(...))
@@ -901,26 +1085,15 @@ def predict_with_embeddings(
             # Per-case: reset the hook's capture list
             _tile_feat_maps.clear()
 
-            tiles: list[dict] = []
-            for crop in tiles_crops:
-                try:
-                    tile_data, tile_origin, tile_crop = save_get_crop(case_arr, crop, mode="shift")
-                except RuntimeError:
-                    tile_data, tile_origin, tile_crop = save_get_crop(
-                        case_arr, crop, mode="symmetric"
-                    )
-                tiles.append(
-                    {
-                        "data": tile_data,
-                        "tile_origin": tile_origin,
-                        "crop": tile_crop,
-                    }
-                )
-
-            # Per-tile inference with hook active
-            boxes_per_tile: list[np.ndarray] = []
-            scores_per_tile: list[np.ndarray] = []
-            feat_maps_per_tile: list[np.ndarray] = []
+            # D01.14-OOM streaming fix: do NOT materialise all tiles up front.
+            # Instead, iterate crops one at a time, run inference, pool immediately,
+            # and release the feature map before the next tile.
+            #
+            # Only the tiny per-tile RawCandidate proposals (bbox + score + 128-D
+            # embedding) accumulate across tiles.  A typical tile's level-0 feature
+            # map is ~(128, ~48, ~48, ~48) float32 ≈ 170 MB; ~300 tiles × 170 MB =
+            # ~50 GB.  With streaming, peak host RAM from feature maps is ~170 MB
+            # (one tile at a time).
 
             import torch  # already available (lazy-imported above via _torch)  # noqa: PLC0415
 
@@ -928,26 +1101,53 @@ def predict_with_embeddings(
                 next(model.parameters()).device if hasattr(model, "parameters") else "cpu"
             )
 
+            # Accumulates only small (bbox, score, embedding) records — O(N_dets).
+            all_proposals_case: list = []
+
             with torch.no_grad():
-                for tile in tiles:
+                for tile_idx, crop in enumerate(tiles_crops):
+                    # Load one tile (one crop of the volume) — released at end of loop body.
+                    try:
+                        tile_data, tile_origin, _tile_crop = save_get_crop(
+                            case_arr, crop, mode="shift"
+                        )
+                    except RuntimeError:
+                        tile_data, tile_origin, _tile_crop = save_get_crop(
+                            case_arr, crop, mode="symmetric"
+                        )
+
                     tile_data_tensor = torch.from_numpy(
-                        tile["data"][None].astype(np.float32)  # add batch dim
+                        tile_data[None].astype(np.float32)  # add batch dim
                     ).to(model_device)
 
                     # inference_step returns dict with pred_boxes/pred_scores/pred_labels
-                    # in tile-LOCAL pixel space (NOT yet offset by tile_origin)
+                    # in tile-LOCAL pixel space (NOT yet offset by tile_origin).
                     result_tile = model.inference_step(tile_data_tensor, batch_num=0)
 
-                    # The hook fired during this inference_step call (via model.forward).
-                    # feat_maps_per_tile: one entry per tile (the LAST hook call for this tile).
+                    # The hook fired during inference_step.  Grab the captured level-0
+                    # feature map (already numpy on CPU), then clear the buffer immediately
+                    # so the array can be freed after pooling.
                     if _tile_feat_maps:
-                        feat_maps_per_tile.append(_tile_feat_maps[-1])
+                        feat_map_raw: object = _tile_feat_maps[-1]
                         _tile_feat_maps.clear()
                     else:
-                        # No hook capture (decoder hook not attached) — use empty
-                        feat_maps_per_tile.append([])
+                        # Hook did not fire (decoder not found) — empty placeholder.
+                        feat_map_raw = []
 
-                    # Extract per-tile boxes/scores (list with one element for batch_size=1)
+                    # On the first tile of the first case, log the captured map shape
+                    # and model device so server-side Step 13 audits can verify the
+                    # hook produced a real (C, D0, D1, D2) array (not (B,C,D0,D1,D2)
+                    # which would need batch-dim stripping) and that the model is on GPU.
+                    if tile_idx == 0 and case_id_str == case_ids_str[0]:
+                        fm_shape = getattr(feat_map_raw, "shape", "no-hook")
+                        logger.debug(
+                            "predict_with_embeddings: tile 0 debug — "
+                            "feat_map_raw.shape=%s model_device=%s",
+                            fm_shape,
+                            model_device,
+                        )
+
+                    # Extract per-tile boxes/scores (list with one element for batch_size=1).
                     tile_boxes_list = result_tile.get("pred_boxes", [])
                     tile_scores_list = result_tile.get("pred_scores", [])
 
@@ -956,20 +1156,32 @@ def predict_with_embeddings(
                         s = tile_scores_list[0]
                         b_np = b.detach().cpu().numpy() if hasattr(b, "detach") else np.array(b)
                         s_np = s.detach().cpu().numpy() if hasattr(s, "detach") else np.array(s)
-                        boxes_per_tile.append(b_np.astype(np.float32))
-                        scores_per_tile.append(s_np.astype(np.float32))
+                        tile_boxes = b_np.astype(np.float32)
+                        tile_scores = s_np.astype(np.float32)
                     else:
-                        boxes_per_tile.append(np.zeros((0, 6), dtype=np.float32))
-                        scores_per_tile.append(np.zeros(0, dtype=np.float32))
+                        tile_boxes = np.zeros((0, 6), dtype=np.float32)
+                        tile_scores = np.zeros(0, dtype=np.float32)
 
-            # Per-tile embedding pooling + WBC across tiles
-            boxes_case, scores_case, embeddings_case = _predict_single_case_with_embeddings(
-                tiles=tiles,
-                feat_maps_per_tile=feat_maps_per_tile,
-                boxes_per_tile=boxes_per_tile,
-                scores_per_tile=scores_per_tile,
-                fpn_level_index=fpn_level_index,
-                iou_threshold=0.5,
+                    # Pool per-tile embeddings immediately at tile-LOCAL centroids, then
+                    # shift boxes to case space — feat_map_raw is no longer needed after this.
+                    # The hook already captured only level 0, so fpn_level_index=0 applies to
+                    # the single-level array directly (the helper handles list or array input).
+                    tile_proposals = _pool_tile_proposals(
+                        feat_map_raw=feat_map_raw,
+                        tile_boxes=tile_boxes,
+                        tile_scores=tile_scores,
+                        tile_origin=tile_origin,
+                        fpn_level_index=0,  # hook already selected level 0
+                        tile_idx=tile_idx,
+                    )
+                    all_proposals_case.extend(tile_proposals)
+
+                    # Release references so GC can reclaim: tile raw data + feature map.
+                    del tile_data, tile_data_tensor, feat_map_raw, result_tile
+
+            # WBC ensemble across all tiles (tiny proposals only — no large arrays here).
+            boxes_case, scores_case, embeddings_case = _ensemble_proposals_to_arrays(
+                all_proposals_case
             )
 
             # boxes_case is in case-preprocessed space; restore to original image space.

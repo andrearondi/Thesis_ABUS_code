@@ -1170,3 +1170,321 @@ def test_d01_14b_preprocess_val_test_raises_importerror_on_laptop() -> None:
         # On laptop, nnDetection is not installed — must raise ImportError.
         with pytest.raises(ImportError):
             preprocess_val_test(fold_dir=fold_dir_str)
+
+
+# ===========================================================================
+# D01.14-OOM — streaming equivalence tests (CPU-only)
+# ===========================================================================
+
+
+def test_pool_tile_proposals_equivalence_with_predict_single_case() -> None:
+    """D01.14-OOM: _pool_tile_proposals + _ensemble_proposals_to_arrays produce
+    numerically equivalent output to _predict_single_case_with_embeddings on a
+    synthetic multi-tile case.
+
+    This is the critical correctness test for the streaming OOM fix.  Both paths
+    must produce identical (boxes, scores, embeddings) up to float32 precision.
+
+    Setup: 3 tiles, each with 1-2 detections at known centroids in tile space.
+    Tile 0: origin (0,0,0), 1 detection, score=0.9
+    Tile 1: origin (10,0,0), 2 detections, scores=0.7 and 0.5
+    Tile 2: origin (0,20,0), 1 detection, score=0.6
+
+    The batch path (_predict_single_case_with_embeddings) receives all tiles/maps
+    up front. The streaming path calls _pool_tile_proposals per tile then
+    _ensemble_proposals_to_arrays.  Both must agree exactly.
+    """
+    from abus.detect.nndet_inference import (
+        D_EMB,
+        _ensemble_proposals_to_arrays,
+        _pool_tile_proposals,
+        _predict_single_case_with_embeddings,
+    )
+
+    rng = np.random.default_rng(2026)
+    C = D_EMB
+    SPATIAL = 12  # tile spatial size for the test
+
+    # Build 3 tiles with known feature maps and detections.
+    num_tiles = 3
+    tile_origins = [
+        (0, 0, 0),
+        (10, 0, 0),
+        (0, 20, 0),
+    ]
+    feat_maps = [
+        rng.standard_normal((C, SPATIAL, SPATIAL, SPATIAL)).astype(np.float32)
+        for _ in range(num_tiles)
+    ]
+
+    # boxes_per_tile in tile-local (x1,y1,x2,y2,z1,z2), all within [0, SPATIAL)
+    boxes_per_tile = [
+        np.array([[1.0, 1.0, 4.0, 4.0, 1.0, 4.0]], dtype=np.float32),  # tile 0: 1 det
+        np.array(
+            [[2.0, 2.0, 5.0, 5.0, 2.0, 5.0], [6.0, 6.0, 9.0, 9.0, 6.0, 9.0]],  # tile 1: 2 dets
+            dtype=np.float32,
+        ),
+        np.array([[3.0, 3.0, 7.0, 7.0, 3.0, 7.0]], dtype=np.float32),  # tile 2: 1 det
+    ]
+    scores_per_tile = [
+        np.array([0.9], dtype=np.float32),
+        np.array([0.7, 0.5], dtype=np.float32),
+        np.array([0.6], dtype=np.float32),
+    ]
+
+    # Build tile dicts as _predict_single_case_with_embeddings expects.
+    tiles = [
+        {"tile_origin": tile_origins[i], "data": np.zeros((1, SPATIAL, SPATIAL, SPATIAL))}
+        for i in range(num_tiles)
+    ]
+
+    # --- Batch path (existing, tested interface) ---
+    boxes_batch, scores_batch, embs_batch = _predict_single_case_with_embeddings(
+        tiles=tiles,
+        feat_maps_per_tile=feat_maps,
+        boxes_per_tile=boxes_per_tile,
+        scores_per_tile=scores_per_tile,
+        fpn_level_index=0,
+        iou_threshold=0.5,
+    )
+
+    # --- Streaming path (new code under test) ---
+    all_proposals = []
+    for i in range(num_tiles):
+        # The hook in the streaming path already selected level 0 as a plain array
+        # (not a list), so feat_maps[i] is passed directly.
+        props = _pool_tile_proposals(
+            feat_map_raw=feat_maps[i],
+            tile_boxes=boxes_per_tile[i],
+            tile_scores=scores_per_tile[i],
+            tile_origin=tile_origins[i],
+            fpn_level_index=0,
+            tile_idx=i,
+        )
+        all_proposals.extend(props)
+
+    boxes_stream, scores_stream, embs_stream = _ensemble_proposals_to_arrays(all_proposals)
+
+    # --- Equivalence assertions ---
+    assert (
+        boxes_batch.shape == boxes_stream.shape
+    ), f"Boxes shape mismatch: batch {boxes_batch.shape} vs stream {boxes_stream.shape}"
+    assert (
+        scores_batch.shape == scores_stream.shape
+    ), f"Scores shape mismatch: batch {scores_batch.shape} vs stream {scores_stream.shape}"
+    assert (
+        embs_batch.shape == embs_stream.shape
+    ), f"Embeddings shape mismatch: batch {embs_batch.shape} vs stream {embs_stream.shape}"
+
+    np.testing.assert_array_equal(
+        boxes_batch,
+        boxes_stream,
+        err_msg="Boxes must be bit-identical between batch and streaming paths",
+    )
+    np.testing.assert_array_equal(
+        scores_batch,
+        scores_stream,
+        err_msg="Scores must be bit-identical between batch and streaming paths",
+    )
+    np.testing.assert_array_equal(
+        embs_batch,
+        embs_stream,
+        err_msg="Embeddings must be bit-identical between batch and streaming paths",
+    )
+
+
+def test_pool_tile_proposals_streaming_one_map_at_a_time() -> None:
+    """D01.14-OOM: _pool_tile_proposals accepts a single (non-list) numpy array
+    as feat_map_raw — the form the streaming hook now produces.
+
+    The hook selects level 0 before appending to _tile_feat_maps (a plain ndarray,
+    not a list of levels).  _pool_tile_proposals must handle both the list form
+    (legacy, used by _predict_single_case_with_embeddings tests) and the plain-array
+    form (new streaming path).
+
+    Verifies: when feat_map_raw is a plain ndarray the result is identical to
+    when it is wrapped in a length-1 list with fpn_level_index=0.
+    """
+    from abus.detect.nndet_inference import D_EMB, _pool_tile_proposals
+
+    rng = np.random.default_rng(99)
+    C = D_EMB
+    feat = rng.standard_normal((C, 8, 8, 8)).astype(np.float32)
+    boxes = np.array([[1.0, 1.0, 3.0, 3.0, 1.0, 3.0]], dtype=np.float32)
+    scores = np.array([0.8], dtype=np.float32)
+    origin = (0, 0, 0)
+
+    # Plain array form (new streaming hook output)
+    props_array = _pool_tile_proposals(
+        feat_map_raw=feat,
+        tile_boxes=boxes,
+        tile_scores=scores,
+        tile_origin=origin,
+        fpn_level_index=0,
+    )
+
+    # List form (batch path / legacy)
+    props_list = _pool_tile_proposals(
+        feat_map_raw=[feat],
+        tile_boxes=boxes,
+        tile_scores=scores,
+        tile_origin=origin,
+        fpn_level_index=0,
+    )
+
+    assert len(props_array) == 1, f"Expected 1 proposal, got {len(props_array)}"
+    assert len(props_list) == 1, f"Expected 1 proposal (list form), got {len(props_list)}"
+
+    np.testing.assert_array_equal(
+        props_array[0].embedding,
+        props_list[0].embedding,
+        err_msg="Plain-array and list-wrapped feat_map must produce identical embeddings",
+    )
+
+
+def test_streaming_hook_only_level0_survives() -> None:
+    """D01.14-OOM: the hook in the streaming path retains only level-0 array.
+
+    Verifies the _decoder_hook closure behaviour via the _pool_tile_proposals
+    output: when called with a list of 4 FPN levels and fpn_level_index=0, the
+    result matches calling it with only level-0 directly.
+
+    This is a unit-level proxy test (we cannot invoke the real hook without a GPU
+    model, but we can test the _pool_tile_proposals level-selection logic which is
+    the consumer of whatever the hook produces).
+    """
+    from abus.detect.nndet_inference import D_EMB, _pool_tile_proposals
+
+    rng = np.random.default_rng(7)
+    C = D_EMB
+
+    # 4 FPN levels — level 0 is the finest (largest spatial size).
+    feat_level0 = rng.standard_normal((C, 8, 8, 8)).astype(np.float32)
+    feat_level1 = rng.standard_normal((C, 4, 4, 4)).astype(np.float32)
+    feat_level2 = rng.standard_normal((C, 2, 2, 2)).astype(np.float32)
+    feat_level3 = rng.standard_normal((C, 1, 1, 1)).astype(np.float32)
+    four_level_list = [feat_level0, feat_level1, feat_level2, feat_level3]
+
+    boxes = np.array([[1.0, 1.0, 3.0, 3.0, 1.0, 3.0]], dtype=np.float32)
+    scores = np.array([0.9], dtype=np.float32)
+    origin = (0, 0, 0)
+
+    # Multi-level list with fpn_level_index=0
+    props_multi = _pool_tile_proposals(
+        feat_map_raw=four_level_list,
+        tile_boxes=boxes,
+        tile_scores=scores,
+        tile_origin=origin,
+        fpn_level_index=0,
+    )
+
+    # Only level-0 array (what the new streaming hook appends)
+    props_single = _pool_tile_proposals(
+        feat_map_raw=feat_level0,
+        tile_boxes=boxes,
+        tile_scores=scores,
+        tile_origin=origin,
+        fpn_level_index=0,
+    )
+
+    assert len(props_multi) == 1
+    assert len(props_single) == 1
+
+    np.testing.assert_array_equal(
+        props_multi[0].embedding,
+        props_single[0].embedding,
+        err_msg=(
+            "Level-0 pooling from 4-level list must equal pooling from level-0 array alone. "
+            "If this fails the hook level-selection or _pool_tile_proposals indexing is wrong."
+        ),
+    )
+
+
+def test_streaming_equivalence_under_score_ties() -> None:
+    """D01.14-OOM: batch and streaming paths agree even when proposals have tied scores.
+
+    Score ties are not present in typical detector output but can occur in edge
+    cases (e.g. two detections from identical tile positions across overlapping tiles).
+    The WBC seed-selection must be stable: both paths iterate proposals in the same
+    order (tile 0 before tile 1, ...) so tied seeds resolve identically.
+
+    This test has two tiles with the same score (0.8) and overlapping boxes that
+    cluster into a single WBC output.  Both paths must produce the same single
+    merged detection.
+    """
+    from abus.detect.nndet_inference import (
+        D_EMB,
+        _ensemble_proposals_to_arrays,
+        _pool_tile_proposals,
+        _predict_single_case_with_embeddings,
+    )
+
+    rng = np.random.default_rng(1234)
+    C = D_EMB
+    SPATIAL = 10
+
+    # Two tiles with the SAME score but different embeddings.
+    # Both detect approximately the same box (high IoU → should cluster).
+    feat0 = rng.standard_normal((C, SPATIAL, SPATIAL, SPATIAL)).astype(np.float32)
+    feat1 = rng.standard_normal((C, SPATIAL, SPATIAL, SPATIAL)).astype(np.float32)
+
+    tile_origins = [(0, 0, 0), (0, 0, 0)]  # same origin → same case-space boxes
+    boxes_per_tile = [
+        np.array([[1.0, 1.0, 5.0, 5.0, 1.0, 5.0]], dtype=np.float32),
+        np.array([[1.5, 1.5, 5.5, 5.5, 1.5, 5.5]], dtype=np.float32),
+    ]
+    # Tied scores — the critical tie-breaking case.
+    scores_per_tile = [
+        np.array([0.8], dtype=np.float32),
+        np.array([0.8], dtype=np.float32),
+    ]
+
+    tiles = [
+        {"tile_origin": tile_origins[i], "data": np.zeros((1, SPATIAL, SPATIAL, SPATIAL))}
+        for i in range(2)
+    ]
+    feat_maps = [feat0, feat1]
+
+    # Batch path
+    boxes_b, scores_b, embs_b = _predict_single_case_with_embeddings(
+        tiles=tiles,
+        feat_maps_per_tile=feat_maps,
+        boxes_per_tile=boxes_per_tile,
+        scores_per_tile=scores_per_tile,
+        fpn_level_index=0,
+        iou_threshold=0.3,  # low threshold so the two overlapping boxes cluster
+    )
+
+    # Streaming path
+    all_props = []
+    for i in range(2):
+        all_props.extend(
+            _pool_tile_proposals(
+                feat_map_raw=feat_maps[i],
+                tile_boxes=boxes_per_tile[i],
+                tile_scores=scores_per_tile[i],
+                tile_origin=tile_origins[i],
+                fpn_level_index=0,
+                tile_idx=i,
+            )
+        )
+    boxes_s, scores_s, embs_s = _ensemble_proposals_to_arrays(all_props, iou_threshold=0.3)
+
+    assert (
+        boxes_b.shape == boxes_s.shape
+    ), f"Boxes shape mismatch under score tie: batch {boxes_b.shape} vs stream {boxes_s.shape}"
+    np.testing.assert_array_equal(
+        boxes_b,
+        boxes_s,
+        err_msg="Boxes must match under score ties (both paths iterate in tile order)",
+    )
+    np.testing.assert_array_equal(
+        scores_b,
+        scores_s,
+        err_msg="Scores must match under score ties",
+    )
+    np.testing.assert_array_equal(
+        embs_b,
+        embs_s,
+        err_msg="Embeddings must match under score ties",
+    )
