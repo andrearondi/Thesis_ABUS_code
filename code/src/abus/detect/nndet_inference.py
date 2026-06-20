@@ -804,6 +804,15 @@ def predict_with_embeddings(
     model = model_list[0]["model"]
     model.eval()
 
+    # D01.14 fix: load_final_model returns a CPU model (torch.load map_location="cpu")
+    # and never moves it to GPU — nnDetection's normal predict path relies on the
+    # Predictor to do that, but this custom tiling loop does not use the Predictor.
+    # Without this, next(model.parameters()).device is "cpu" and the entire 3D
+    # detector runs on CPU (Step 13 audit silently grinds for many minutes; Steps
+    # 14/16 at scale become infeasible). Move to CUDA so inference_step runs on GPU.
+    if _torch.cuda.is_available():
+        model.cuda()
+
     # Plan parameters for tiling (same as predictor.create uses)
     crop_size = plan["patch_size"]
     overlap_frac = 0.5
