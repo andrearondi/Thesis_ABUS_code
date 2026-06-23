@@ -299,7 +299,7 @@ def _raw_detections_to_candidates(
         raise ValueError(
             f"_raw_detections_to_candidates: rd.embeddings is None for case_id={rd.case_id}. "
             "D01.17 requires real (N, D_EMB) embeddings from pool_embeddings_at_boxes. "
-            "Do not pass RawDetections (CLI per-key schema) to this function — "
+            "Do not pass a bare RawDetections (embeddings=None) to this function — "
             "use predict_oof then pool_embeddings_at_boxes which returns a RawDetectionsWithEmb "
             "with real embeddings (D01.17 decoupled design)."
         )

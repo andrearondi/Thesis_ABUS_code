@@ -12,7 +12,7 @@ Public objects:
 
   RawDetections
     Intermediate per-case detection record (boxes/scores only; embeddings=None).
-    Used by parse_predictions_dir (CLI per-key reader) and predict_oof.
+    Used by parse_predictions_dir (consolidated-dict reader) and predict_oof.
     Box axis order: (x1, y1, x2, y2, z1, z2) — nndet/core/boxes/ops.py line 34.
 
   RawDetectionsWithEmb
@@ -25,7 +25,8 @@ Public objects:
     D01.14 axis convention: feat axis 1=d0=z, axis 2=d1=y, axis 3=d2=x.
 
   parse_predictions_dir(pred_dir) -> dict[int, RawDetections]
-    Discovers *_pred_boxes.pkl files in pred_dir and parses them (CLI schema).
+    Discovers *_boxes.pkl files in pred_dir and parses them (consolidated-dict schema,
+    server-verified 2026-06-23 against nnDetection commit 97a58f3).
 
   predict_oof(fold, case_ids, preprocessed_dir, fold_dir, ...) -> dict[int, RawDetections]
     Drives nnDetection 0.1's predict_dir(case_ids=...) helper for the OOF path.
@@ -68,12 +69,29 @@ Public objects:
     from the raw test set (raw_splitted/imagesTs/). Must be called BEFORE
     predict_with_embeddings for val/test cases. Lazy imports; server-only.
 
-nnDetection 0.1 output schema (D01.13, source-grounded, commit 97a58f3):
-  predict_dir(save_state=False) writes ONE FILE PER KEY:
-    <case_id>_pred_boxes.pkl  — pickle of np.ndarray (N, 6) float32
-    <case_id>_pred_scores.pkl — pickle of np.ndarray (N,) float32
-    <case_id>_pred_labels.pkl — pickle of np.ndarray (N,) int
-  Source: helper.py:103-110.
+nnDetection 0.1 output schema (server-verified 2026-06-23, commit 97a58f3):
+  predict_dir(save_state=False) writes ONE CONSOLIDATED FILE PER CASE:
+    <case_id>_boxes.pkl  — pickle of dict with keys:
+      "pred_boxes":   np.ndarray (N, 6) float32 — box axis (x1, y1, x2, y2, z1, z2)
+      "pred_scores":  np.ndarray (N,)   float32
+      "pred_labels":  np.ndarray (N,)   float32
+      "restore":      bool scalar
+      "original_size_of_raw_data": np.ndarray (3,) int64
+      "itk_origin":   np.ndarray (3,)   float64
+      "itk_spacing":  np.ndarray (3,)   float64
+      "itk_direction":np.ndarray (9,)   float64
+
+  Verified by loading the actual file for case 5 on the server:
+    0005_boxes.pkl  ->  dict, keys as above
+    pred_boxes shape (265, 6) float32, pred_scores shape (265,) float32
+
+  The previously documented D01.13 per-key schema (predict_dir writing separate
+  <case>_pred_boxes.pkl + <case>_pred_scores.pkl files) was WRONG. The local
+  nnDetection-main checkout (also commit 97a58f3) uses a different code path
+  (helper.py in the local copy writes per-key files); the server's installed
+  package at commit 97a58f3 writes the consolidated dict. Trust the server
+  probe, not the local source.
+
   NO embeddings key — embeddings are set to None from parse_predictions_dir.
 
   Box axis (x1,y1,x2,y2,z1,z2):
@@ -179,27 +197,39 @@ class RawDetectionsWithEmb:
 
 
 def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
-    """Discover and parse nnDetection 0.1's per-key outputs in ``pred_dir``.
+    """Discover and parse nnDetection 0.1's consolidated outputs in ``pred_dir``.
 
-    D01.13 schema (source-grounded, commit 97a58f3):
-      predict_dir(save_state=False) writes one file per result key:
-        <case_id>_pred_boxes.pkl  — np.ndarray (N, 6) float32
-        <case_id>_pred_scores.pkl — np.ndarray (N,) float32
-        <case_id>_pred_labels.pkl — np.ndarray (N,) int  (not used here)
-      Source: helper.py:103-110 ``for key, item in to_numpy(result).items(): ...``
+    Real schema (server-verified 2026-06-23, commit 97a58f3):
+      predict_dir(save_state=False) writes ONE FILE PER CASE:
+        <case_id>_boxes.pkl  — pickle of dict containing:
+          "pred_boxes":   np.ndarray (N, 6) float32  (x1,y1,x2,y2,z1,z2)
+          "pred_scores":  np.ndarray (N,)   float32
+          "pred_labels":  np.ndarray (N,)   float32
+          "restore":      bool scalar
+          "original_size_of_raw_data": np.ndarray (3,) int64
+          "itk_origin":   np.ndarray (3,)   float64
+          "itk_spacing":  np.ndarray (3,)   float64
+          "itk_direction":np.ndarray (9,)   float64
       Box axis: (x1, y1, x2, y2, z1, z2) — nndet/core/boxes/ops.py line 34.
       NO embeddings key. RawDetections.embeddings is always None.
 
+    NOTE: The D01.13 docstring previously claimed per-key files
+    (<case>_pred_boxes.pkl + <case>_pred_scores.pkl). That was WRONG. The server
+    probe (2026-06-23) showed the consolidated dict schema above. The glob pattern
+    was changed from ``*_pred_boxes.pkl`` to ``*_boxes.pkl`` to match reality.
+
     Parsing rules:
-      - Only files matching ``*_pred_boxes.pkl`` are processed (anchors case discovery).
-      - Filename format: ``<case_id_str>_pred_boxes.pkl`` where ``<case_id_str>``
-        is a zero-padded integer (e.g. ``0042``). The integer is extracted by
-        stripping ``_pred_boxes`` and calling int().
+      - Only files matching ``*_boxes.pkl`` are processed (anchors case discovery).
+      - Filename format: ``<case_id_str>_boxes.pkl`` where ``<case_id_str>`` is a
+        zero-padded integer (e.g. ``0042``). The integer is extracted by stripping
+        ``_boxes`` and calling int().
       - Files whose prefix cannot be parsed as an integer are skipped with a
-        WARNING log (defect-prevention: logged, not silently absorbed — echo of
-        STORY_01_01 D01.9 silent-zero lesson).
-      - The corresponding ``*_pred_scores.pkl`` is loaded from the same directory.
-        If the scores file is missing, a WARNING is logged and the case is skipped.
+        WARNING log (defect-prevention: logged, not silently absorbed).
+      - Each .pkl is loaded as a dict. If "pred_boxes" or "pred_scores" keys are
+        missing, a WARNING is logged and the case is skipped.
+      - A case with pred_boxes shape (0, 6) (genuinely empty detection set) is
+        valid and produces a RawDetections with empty arrays — distinct from
+        file-not-found or malformed dict.
       - Boxes and scores are coerced to float32.
 
     Pure-Python; CPU-safe; no nnDetection required.
@@ -207,7 +237,7 @@ def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
     Parameters
     ----------
     pred_dir : str
-        Path to the directory containing per-key pickle files.
+        Path to the directory containing consolidated pickle files.
 
     Returns
     -------
@@ -217,12 +247,17 @@ def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
     pred_path = Path(pred_dir)
     result: dict[int, RawDetections] = {}
 
-    # Anchor on *_pred_boxes.pkl — one per case (D01.13 per-key schema)
-    boxes_files = sorted(pred_path.glob("*_pred_boxes.pkl"))
+    # Anchor on *_boxes.pkl — one per case (server-verified consolidated schema,
+    # 2026-06-23, commit 97a58f3). Do NOT use *_pred_boxes.pkl; that glob matches
+    # nothing on the server.
+    boxes_files = sorted(pred_path.glob("*_boxes.pkl"))
 
     for boxes_file in boxes_files:
-        stem = boxes_file.stem  # e.g. "0042_pred_boxes"
-        suffix = "_pred_boxes"
+        stem = boxes_file.stem  # e.g. "0042_boxes"
+        suffix = "_boxes"
+        # The glob guarantees stems end with "_boxes", but this guard is
+        # belt-and-suspenders: if the glob pattern ever changes, the suffix
+        # check prevents silent misparses rather than silently producing wrong case_ids.
         if not stem.endswith(suffix):
             logger.warning(
                 "parse_predictions_dir: skipping file %s — unexpected stem %r",
@@ -232,6 +267,16 @@ def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
             continue
 
         case_id_str = stem[: -len(suffix)]
+        # Strict integer check: nnDetection emits 4-digit zero-padded names only.
+        # Guard against Python's int() accepting underscores, sign chars, whitespace.
+        if not case_id_str.isdigit():
+            logger.warning(
+                "parse_predictions_dir: skipping file %s — prefix %r is not a "
+                "pure decimal integer (expected 4-digit zero-padded case_id)",
+                boxes_file.name,
+                case_id_str,
+            )
+            continue
         try:
             case_id = int(case_id_str)
         except ValueError:
@@ -243,26 +288,44 @@ def parse_predictions_dir(pred_dir: str) -> dict[int, RawDetections]:
             )
             continue
 
-        # Load the corresponding scores file
-        scores_file = pred_path / f"{case_id_str}_pred_scores.pkl"
-        if not scores_file.exists():
+        with open(boxes_file, "rb") as f:
+            pred_dict = pickle.load(f)  # noqa: S301
+
+        if not isinstance(pred_dict, dict):
             logger.warning(
-                "parse_predictions_dir: skipping case_id=%d — scores file %s not found",
+                "parse_predictions_dir: skipping case_id=%d — expected dict in %s, " "got %s",
                 case_id,
-                scores_file.name,
+                boxes_file.name,
+                type(pred_dict).__name__,
             )
             continue
 
-        with open(boxes_file, "rb") as f:
-            boxes_raw = pickle.load(f)  # noqa: S301
-        with open(scores_file, "rb") as f:
-            scores_raw = pickle.load(f)  # noqa: S301
+        if "pred_boxes" not in pred_dict or "pred_scores" not in pred_dict:
+            logger.warning(
+                "parse_predictions_dir: skipping case_id=%d — file %s missing "
+                "'pred_boxes' or 'pred_scores' key (keys found: %s)",
+                case_id,
+                boxes_file.name,
+                sorted(pred_dict.keys()),
+            )
+            continue
 
-        boxes = np.asarray(boxes_raw, dtype=np.float32)
-        scores = np.asarray(scores_raw, dtype=np.float32)
+        boxes = np.asarray(pred_dict["pred_boxes"], dtype=np.float32)
+        scores = np.asarray(pred_dict["pred_scores"], dtype=np.float32)
 
-        # Embeddings are NOT in the per-key predict_dir output (D01.13).
-        # Zero-vector placeholder is filled by candidates.py.
+        # A case with pred_boxes shape (0, 6) is valid (no detections) — keep it.
+        # Shape validation: boxes must be 2-D with last dim 6.
+        if boxes.ndim != 2 or boxes.shape[1] != 6:
+            logger.warning(
+                "parse_predictions_dir: skipping case_id=%d — pred_boxes has unexpected "
+                "shape %s (expected (N, 6))",
+                case_id,
+                boxes.shape,
+            )
+            continue
+
+        # Embeddings are NOT in the consolidated predict_dir output.
+        # pool_embeddings_at_boxes fills them in the decoupled D01.17 path.
         result[case_id] = RawDetections(
             case_id=case_id,
             boxes=boxes,
@@ -400,7 +463,7 @@ def predict_oof(
                           receives these boxes directly — no affine inversion needed)
          - case_ids     = [f"{cid:04d}" for cid in case_ids]
            (4-digit zero-padded strings matching preprocessed .npz stems)
-         - save_state   = False (write per-key pkls; D01.13 per-key schema)
+         - save_state   = False (write consolidated per-case dicts; server schema 2026-06-23)
       4. Parses the tempdir via parse_predictions_dir and returns the dict.
 
     Caller (generate_oof_candidates) is responsible for the leakage guard —
@@ -438,7 +501,7 @@ def predict_oof(
         Keyed by case_id (int). Boxes in (x1,y1,x2,y2,z1,z2) axis in
         PREPROCESSED space (restore=False, D01.17). Pass directly to
         pool_embeddings_at_boxes without coordinate conversion.
-        embeddings is always None (D01.13: not in per-key output).
+        embeddings is always None (not in consolidated predict_dir output, 2026-06-23).
 
     Raises
     ------

@@ -1,20 +1,27 @@
 """Tests for src/abus/detect/nndet_inference.py (STORY_01_02, D01.9 + D01.13).
 
-Schema note (D01.13, source-grounded against nnDetection 0.1 commit 97a58f3):
-  predict_dir(save_state=False) writes ONE FILE PER KEY:
-    <case_id>_pred_boxes.pkl   — pickle of np.ndarray shape (N, 6) float32
-    <case_id>_pred_scores.pkl  — pickle of np.ndarray shape (N,) float32
-    <case_id>_pred_labels.pkl  — pickle of np.ndarray shape (N,) int/float
+Schema note (server-verified 2026-06-23 against nnDetection 0.1 commit 97a58f3):
+  predict_dir(save_state=False) writes ONE CONSOLIDATED FILE PER CASE:
+    <case_id>_boxes.pkl  — pickle of dict containing:
+      "pred_boxes":   np.ndarray (N, 6) float32  axis (x1,y1,x2,y2,z1,z2)
+      "pred_scores":  np.ndarray (N,)   float32
+      "pred_labels":  np.ndarray (N,)   float32
+      "restore":      bool scalar
+      "original_size_of_raw_data": np.ndarray (3,) int64
+      "itk_origin":   np.ndarray (3,)   float64
+      "itk_spacing":  np.ndarray (3,)   float64
+      "itk_direction":np.ndarray (9,)   float64
 
   Box axis order (nndet/core/boxes/ops.py line 34, detection.py line 228):
     (x1, y1, x2, y2, z1, z2)  — NOT (z1, y1, x1, z2, y2, x2)
 
-  NO embeddings key in the predict_dir output (helper.py:103-110, to_numpy).
-  Embeddings are set to None in RawDetections; generate_candidates fills a
-  zero-vector placeholder until STORY_01_04 wires backbone extraction.
+  NO embeddings key in the consolidated output.
+  Embeddings are set to None in RawDetections; pool_embeddings_at_boxes (D01.17)
+  fills them in the decoupled path.
 
-  D01.9 schema (single *_boxes.pkl dict with 'boxes'/'scores'/'embeddings')
-  is SUPERSEDED. Tests updated to mirror the real per-key schema.
+  The previously documented D01.13 per-key schema (<case>_pred_boxes.pkl +
+  <case>_pred_scores.pkl) was WRONG. Tests have been re-pinned to the
+  real consolidated dict schema (2026-06-23 fix).
 """
 
 from __future__ import annotations
@@ -33,30 +40,36 @@ from abus.detect.nndet_inference import RawDetections, parse_predictions_dir
 # Helpers: build synthetic pickle fixtures
 # ---------------------------------------------------------------------------
 
-NNDET_SCHEMA_VERSION = "0.1_97a58f3_D01.13"  # commit short hash + decision
+NNDET_SCHEMA_VERSION = "0.1_97a58f3_server_verified_2026-06-23"  # server probe + schema fix
 
 
-def _write_per_key_pkls(
+def _write_consolidated_pkl(
     tmpdir: Path,
     case_id_str: str,
     n_dets: int = 3,
     boxes_override: np.ndarray | None = None,
     scores_override: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Write synthetic nnDetection per-key pkl files for one case.
+    """Write a synthetic consolidated nnDetection <case>_boxes.pkl for one case.
 
-    D01.13 schema (source-grounded):
-      <case_id>_pred_boxes.pkl  — np.ndarray (N, 6) float32, axis (x1,y1,x2,y2,z1,z2)
-      <case_id>_pred_scores.pkl — np.ndarray (N,) float32
-      <case_id>_pred_labels.pkl — np.ndarray (N,) int32
+    Real nnDetection 0.1 output schema (server-verified 2026-06-23, commit 97a58f3):
+      <case_id>_boxes.pkl  — pickle of dict containing:
+        "pred_boxes":   np.ndarray (N, 6) float32  axis (x1,y1,x2,y2,z1,z2)
+        "pred_scores":  np.ndarray (N,)   float32
+        "pred_labels":  np.ndarray (N,)   float32
+        "restore":      bool scalar
+        "original_size_of_raw_data": np.ndarray (3,) int64
+        "itk_origin":   np.ndarray (3,)   float64
+        "itk_spacing":  np.ndarray (3,)   float64
+        "itk_direction":np.ndarray (9,)   float64
 
     Returns dict with 'boxes' and 'scores' for verification.
-    No embeddings file — embeddings are not in predict_dir output (D01.13).
+    No embeddings key — embeddings are not in predict_dir output.
     """
     if boxes_override is not None:
         boxes = boxes_override.astype(np.float32)
     else:
-        # Synthetic boxes in (x1,y1,x2,y2,z1,z2) format — D01.13 confirmed axis
+        # Synthetic boxes in (x1,y1,x2,y2,z1,z2) format — server-verified axis
         boxes = np.arange(n_dets * 6, dtype=np.float32).reshape(n_dets, 6)
         # Ensure max > min: cols 0,1→min x,y; cols 2,3→max x,y; cols 4,5→z1,z2
         boxes[:, 2] += 2.0  # x2 > x1
@@ -68,59 +81,63 @@ def _write_per_key_pkls(
     else:
         scores = np.linspace(0.9, 0.5, n_dets, dtype=np.float32)
 
-    labels = np.zeros(n_dets, dtype=np.int32)
+    pred_dict = {
+        "pred_boxes": boxes,
+        "pred_scores": scores,
+        "pred_labels": np.zeros(n_dets, dtype=np.float32),
+        "restore": False,
+        "original_size_of_raw_data": np.array([100, 200, 300], dtype=np.int64),
+        "itk_origin": np.zeros(3, dtype=np.float64),
+        "itk_spacing": np.ones(3, dtype=np.float64),
+        "itk_direction": np.eye(3, dtype=np.float64).ravel(),
+    }
 
-    with open(tmpdir / f"{case_id_str}_pred_boxes.pkl", "wb") as f:
-        pickle.dump(boxes, f)
-    with open(tmpdir / f"{case_id_str}_pred_scores.pkl", "wb") as f:
-        pickle.dump(scores, f)
-    with open(tmpdir / f"{case_id_str}_pred_labels.pkl", "wb") as f:
-        pickle.dump(labels, f)
+    with open(tmpdir / f"{case_id_str}_boxes.pkl", "wb") as f:
+        pickle.dump(pred_dict, f)
 
     return {"boxes": boxes, "scores": scores}
 
 
 # ---------------------------------------------------------------------------
-# D01.13: test_parse_predictions_dir_basic — per-key schema
+# schema: test_parse_predictions_dir_basic — consolidated dict schema
 # ---------------------------------------------------------------------------
 
 
-def test_parse_predictions_dir_basic_per_key_schema() -> None:
-    """D01.13: parse_predictions_dir reads per-key files (pred_boxes/pred_scores).
+def test_parse_predictions_dir_basic_consolidated_schema() -> None:
+    """parse_predictions_dir reads consolidated <case>_boxes.pkl dict files.
 
-    Real nnDetection 0.1 output (helper.py:103-110, to_numpy):
-      <case_id>_pred_boxes.pkl  — np.ndarray (N,6) float32
-      <case_id>_pred_scores.pkl — np.ndarray (N,) float32
-    No embeddings file. RawDetections.embeddings must be None.
+    Real nnDetection 0.1 output (server-verified 2026-06-23, commit 97a58f3):
+      <case_id>_boxes.pkl  — pickle of dict with pred_boxes (N,6) + pred_scores (N,)
+    No embeddings key. RawDetections.embeddings must be None.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         n_dets = 4
-        written = _write_per_key_pkls(tmp, "0042", n_dets=n_dets)
+        written = _write_consolidated_pkl(tmp, "0042", n_dets=n_dets)
 
         result = parse_predictions_dir(tmpdir)
 
     assert isinstance(result, dict)
-    assert 42 in result, "case_id 42 must be in result (from '0042_pred_boxes.pkl')"
+    assert 42 in result, "case_id 42 must be in result (from '0042_boxes.pkl')"
 
     rd = result[42]
     assert isinstance(rd, RawDetections)
     assert rd.case_id == 42
     assert rd.boxes.shape == (n_dets, 6)
     assert rd.scores.shape == (n_dets,)
-    assert rd.embeddings is None, "embeddings must be None (not in per-key output)"
+    assert rd.embeddings is None, "embeddings must be None (not in consolidated output)"
 
     np.testing.assert_allclose(rd.boxes, written["boxes"], rtol=1e-5)
     np.testing.assert_allclose(rd.scores, written["scores"], rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
-# D01.13: box axis is (x1,y1,x2,y2,z1,z2)
+# box axis is (x1,y1,x2,y2,z1,z2) — preserved from consolidated dict
 # ---------------------------------------------------------------------------
 
 
 def test_parse_predictions_dir_box_axis_order_x1y1x2y2z1z2() -> None:
-    """D01.13: boxes from pred_boxes.pkl are in (x1,y1,x2,y2,z1,z2) axis order.
+    """boxes from consolidated _boxes.pkl are in (x1,y1,x2,y2,z1,z2) axis order.
 
     Source proof: nndet/core/boxes/ops.py line 34:
       'expected to be in (x1, y1, x2, y2, z1, z2) format'
@@ -140,13 +157,13 @@ def test_parse_predictions_dir_box_axis_order_x1y1x2y2z1z2() -> None:
         tmp = Path(tmpdir)
         # Write a known box: x1=10, y1=20, x2=30, y2=40, z1=5, z2=15
         boxes_known = np.array([[10.0, 20.0, 30.0, 40.0, 5.0, 15.0]], dtype=np.float32)
-        _write_per_key_pkls(tmp, "0001", n_dets=1, boxes_override=boxes_known)
+        _write_consolidated_pkl(tmp, "0001", n_dets=1, boxes_override=boxes_known)
 
         result = parse_predictions_dir(tmpdir)
 
     rd = result[1]
     box = rd.boxes[0]
-    # D01.13: axis is (x1, y1, x2, y2, z1, z2)
+    # axis is (x1, y1, x2, y2, z1, z2) — server-verified
     assert box[0] == 10.0, f"boxes[:,0] should be x1=10, got {box[0]}"
     assert box[1] == 20.0, f"boxes[:,1] should be y1=20, got {box[1]}"
     assert box[2] == 30.0, f"boxes[:,2] should be x2=30, got {box[2]}"
@@ -156,67 +173,67 @@ def test_parse_predictions_dir_box_axis_order_x1y1x2y2z1z2() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D01.13: embeddings are always None from per-key output
+# embeddings are always None from consolidated output
 # ---------------------------------------------------------------------------
 
 
-def test_parse_predictions_dir_embeddings_always_none_in_per_key_schema() -> None:
-    """D01.13: embeddings are NOT in predict_dir per-key output; RawDetections.embeddings=None.
+def test_parse_predictions_dir_embeddings_always_none_in_consolidated_schema() -> None:
+    """Embeddings are NOT in predict_dir consolidated output; RawDetections.embeddings=None.
 
-    helper.py:103-110: to_numpy(result) saves each key. get_case_result returns
-    pred_boxes/pred_scores/pred_labels/restore/... — NO 'embeddings' key.
-    Even if an extra *_pred_embeddings.pkl were present it is not parsed.
+    The consolidated dict has no 'embeddings' key (server-verified 2026-06-23).
+    pool_embeddings_at_boxes (D01.17) fills embeddings in the decoupled path.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        _write_per_key_pkls(tmp, "0010", n_dets=3)
-        # Even if we write a spurious embeddings file, embeddings should still be None
-        emb = np.ones((3, 16), dtype=np.float32)
-        with open(tmp / "0010_pred_embeddings.pkl", "wb") as f:
-            pickle.dump(emb, f)
+        _write_consolidated_pkl(tmp, "0010", n_dets=3)
 
         result = parse_predictions_dir(tmpdir)
 
     rd = result[10]
-    assert rd.embeddings is None, (
-        f"embeddings must be None from per-key schema even if extra files exist, "
-        f"got {rd.embeddings}"
-    )
+    assert (
+        rd.embeddings is None
+    ), f"embeddings must be None from consolidated schema, got {rd.embeddings}"
 
 
 # ---------------------------------------------------------------------------
-# D01.13: filename parser — case_id from *_pred_boxes.pkl
+# filename parser — case_id from *_boxes.pkl
 # ---------------------------------------------------------------------------
 
 
 def test_parse_predictions_dir_filename_parser_strips_leading_zeros() -> None:
-    """case_id integer extracted from '0042_pred_boxes.pkl' stem prefix -> 42."""
+    """case_id integer extracted from '0042_boxes.pkl' stem prefix -> 42."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        _write_per_key_pkls(tmp, "0000", n_dets=1)
-        _write_per_key_pkls(tmp, "0007", n_dets=1)
-        _write_per_key_pkls(tmp, "0099", n_dets=1)
-        _write_per_key_pkls(tmp, "0199", n_dets=1)
+        _write_consolidated_pkl(tmp, "0000", n_dets=1)
+        _write_consolidated_pkl(tmp, "0007", n_dets=1)
+        _write_consolidated_pkl(tmp, "0099", n_dets=1)
+        _write_consolidated_pkl(tmp, "0199", n_dets=1)
 
         result = parse_predictions_dir(tmpdir)
 
     assert set(result.keys()) == {0, 7, 99, 199}
 
 
-def test_parse_predictions_dir_malformed_pred_boxes_filename_skipped(
+def test_parse_predictions_dir_malformed_boxes_filename_skipped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Malformed filenames (non-integer prefix in *_pred_boxes.pkl) are skipped."""
+    """Malformed filenames (non-integer prefix in *_boxes.pkl) are skipped."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        _write_per_key_pkls(tmp, "0001", n_dets=2)
-        # Malformed: prefix before _pred_boxes cannot be parsed as int
-        malformed_boxes = np.ones((1, 6), dtype=np.float32)
-        with open(tmp / "badname_pred_boxes.pkl", "wb") as f:
-            pickle.dump(malformed_boxes, f)
-        malformed_scores = np.ones(1, dtype=np.float32)
-        with open(tmp / "badname_pred_scores.pkl", "wb") as f:
-            pickle.dump(malformed_scores, f)
+        _write_consolidated_pkl(tmp, "0001", n_dets=2)
+        # Malformed: prefix before _boxes cannot be parsed as int
+        malformed_dict = {
+            "pred_boxes": np.ones((1, 6), dtype=np.float32),
+            "pred_scores": np.ones(1, dtype=np.float32),
+            "pred_labels": np.zeros(1, dtype=np.float32),
+            "restore": False,
+            "original_size_of_raw_data": np.array([100, 200, 300], dtype=np.int64),
+            "itk_origin": np.zeros(3, dtype=np.float64),
+            "itk_spacing": np.ones(3, dtype=np.float64),
+            "itk_direction": np.eye(3, dtype=np.float64).ravel(),
+        }
+        with open(tmp / "badname_boxes.pkl", "wb") as f:
+            pickle.dump(malformed_dict, f)
 
         with caplog.at_level(logging.WARNING):
             result = parse_predictions_dir(tmpdir)
@@ -230,17 +247,21 @@ def test_parse_predictions_dir_malformed_pred_boxes_filename_skipped(
 
 
 # ---------------------------------------------------------------------------
-# D01.13: zero detections
+# zero detections — distinct from file-not-found
 # ---------------------------------------------------------------------------
 
 
 def test_parse_predictions_dir_zero_detections() -> None:
-    """An empty boxes array (0 detections) is handled; entry present with shape (0,6)."""
+    """An empty pred_boxes (0 detections) is handled; entry present with shape (0,6).
+
+    A case with pred_boxes shape (0, 6) (genuinely empty detection set) is valid.
+    This is distinct from 'file not found' and must NOT be dropped silently.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         empty_boxes = np.zeros((0, 6), dtype=np.float32)
         empty_scores = np.zeros((0,), dtype=np.float32)
-        _write_per_key_pkls(
+        _write_consolidated_pkl(
             tmp,
             "0005",
             n_dets=0,
@@ -257,17 +278,17 @@ def test_parse_predictions_dir_zero_detections() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D01.13: multiple cases
+# multiple cases
 # ---------------------------------------------------------------------------
 
 
 def test_parse_predictions_dir_multiple_cases() -> None:
-    """Multiple cases each with per-key pkl files are all parsed correctly."""
+    """Multiple cases each with a consolidated _boxes.pkl are all parsed correctly."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         case_ids = [0, 1, 42, 99]
         for cid in case_ids:
-            _write_per_key_pkls(tmp, f"{cid:04d}", n_dets=2)
+            _write_consolidated_pkl(tmp, f"{cid:04d}", n_dets=2)
 
         result = parse_predictions_dir(tmpdir)
 
@@ -279,7 +300,7 @@ def test_parse_predictions_dir_multiple_cases() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D01.13: no files
+# no files
 # ---------------------------------------------------------------------------
 
 
@@ -289,6 +310,150 @@ def test_parse_predictions_dir_no_files() -> None:
         result = parse_predictions_dir(tmpdir)
 
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: parser must NOT glob *_pred_boxes.pkl (old wrong schema)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_predictions_dir_rejects_pred_boxes_schema() -> None:
+    """REGRESSION: parser must return empty dict when only old per-key files are present.
+
+    This test fails if the parser regresses to globbing *_pred_boxes.pkl.
+    The server nnDetection (commit 97a58f3) writes <case>_boxes.pkl (consolidated
+    dict), NOT <case>_pred_boxes.pkl (old per-key array). If the parser were to
+    switch back to the old glob, it would again return 0 boxes on the server.
+
+    Root cause history: parse_predictions_dir previously globbed *_pred_boxes.pkl,
+    which matched NO files on the server, causing predict_oof to return 0 boxes.
+    Fix (2026-06-23): glob *_boxes.pkl and load as dict. This test pins the fix.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # Write ONLY old per-key files — parser must NOT pick these up
+        boxes = np.array([[1.0, 2.0, 3.0, 4.0, 0.0, 1.0]], dtype=np.float32)
+        scores = np.array([0.9], dtype=np.float32)
+        labels = np.zeros(1, dtype=np.int32)
+        with open(tmp / "0042_pred_boxes.pkl", "wb") as f:
+            pickle.dump(boxes, f)
+        with open(tmp / "0042_pred_scores.pkl", "wb") as f:
+            pickle.dump(scores, f)
+        with open(tmp / "0042_pred_labels.pkl", "wb") as f:
+            pickle.dump(labels, f)
+
+        result = parse_predictions_dir(tmpdir)
+
+    assert result == {}, (
+        f"Parser must return empty dict when only *_pred_boxes.pkl files are present "
+        f"(old wrong schema). Got: {list(result.keys())}. "
+        "If this fails, the parser has regressed to the old glob pattern."
+    )
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: malformed dict (missing keys) is skipped with warning
+# ---------------------------------------------------------------------------
+
+
+def test_parse_predictions_dir_missing_keys_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A _boxes.pkl file that is a dict but missing pred_boxes/pred_scores is skipped."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # Write one good case
+        _write_consolidated_pkl(tmp, "0001", n_dets=2)
+        # Write a malformed case: dict exists but missing required keys
+        malformed = {"restore": False, "itk_origin": np.zeros(3)}
+        with open(tmp / "0007_boxes.pkl", "wb") as f:
+            pickle.dump(malformed, f)
+
+        with caplog.at_level(logging.WARNING):
+            result = parse_predictions_dir(tmpdir)
+
+    assert set(result.keys()) == {
+        1
+    }, f"Malformed dict (missing keys) must be skipped, got {list(result.keys())}"
+    assert any(
+        "pred_boxes" in record.message
+        or "pred_scores" in record.message
+        or "skip" in record.message.lower()
+        for record in caplog.records
+    ), "Expected a warning about missing keys"
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: non-dict payload is skipped with warning
+# ---------------------------------------------------------------------------
+
+
+def test_parse_predictions_dir_non_dict_payload_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A _boxes.pkl file that is NOT a dict is skipped with a warning.
+
+    Old per-key schema wrote raw numpy arrays directly. If such a file appears
+    (e.g. stale output on a server with mixed nnDetection versions), the parser
+    must skip it gracefully, not crash.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # Write one good case
+        _write_consolidated_pkl(tmp, "0001", n_dets=2)
+        # Write a _boxes.pkl that contains a raw array (old wrong schema accident)
+        with open(tmp / "0009_boxes.pkl", "wb") as f:
+            pickle.dump(np.ones((3, 6), dtype=np.float32), f)
+
+        with caplog.at_level(logging.WARNING):
+            result = parse_predictions_dir(tmpdir)
+
+    assert set(result.keys()) == {
+        1
+    }, f"Non-dict _boxes.pkl must be skipped, got {list(result.keys())}"
+    assert any(
+        "dict" in record.message.lower() or "skip" in record.message.lower()
+        for record in caplog.records
+    ), "Expected a warning about non-dict payload"
+
+
+def test_parse_predictions_dir_wrong_shape_pred_boxes_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A _boxes.pkl dict with pred_boxes of wrong shape is skipped with a warning.
+
+    Real schema requires pred_boxes shape (N, 6). Shapes like (N,) or (N, 4)
+    are malformed (wrong detector output) and must be skipped, not silently
+    passed downstream where they would cause crashes or wrong distances.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # Write one good case
+        _write_consolidated_pkl(tmp, "0001", n_dets=2)
+        # Write a malformed case: pred_boxes has wrong shape (N, 4) instead of (N, 6)
+        malformed = {
+            "pred_boxes": np.ones((3, 4), dtype=np.float32),
+            "pred_scores": np.ones(3, dtype=np.float32),
+            "pred_labels": np.zeros(3, dtype=np.float32),
+            "restore": False,
+            "original_size_of_raw_data": np.array([100, 200, 300], dtype=np.int64),
+            "itk_origin": np.zeros(3, dtype=np.float64),
+            "itk_spacing": np.ones(3, dtype=np.float64),
+            "itk_direction": np.eye(3, dtype=np.float64).ravel(),
+        }
+        with open(tmp / "0008_boxes.pkl", "wb") as f:
+            pickle.dump(malformed, f)
+
+        with caplog.at_level(logging.WARNING):
+            result = parse_predictions_dir(tmpdir)
+
+    assert set(result.keys()) == {
+        1
+    }, f"Wrong-shape pred_boxes must be skipped, got {list(result.keys())}"
+    assert any(
+        "shape" in record.message.lower() or "skip" in record.message.lower()
+        for record in caplog.records
+    ), "Expected a warning about malformed shape"
 
 
 # ---------------------------------------------------------------------------
@@ -319,13 +484,18 @@ def test_parse_predictions_dir_boxes_dtype_coerced_to_float32() -> None:
         tmp = Path(tmpdir)
         boxes64 = np.ones((3, 6), dtype=np.float64)
         scores64 = np.array([0.9, 0.8, 0.7], dtype=np.float64)
-        with open(tmp / "0020_pred_boxes.pkl", "wb") as f:
-            pickle.dump(boxes64, f)
-        with open(tmp / "0020_pred_scores.pkl", "wb") as f:
-            pickle.dump(scores64, f)
-        labels = np.zeros(3, dtype=np.int32)
-        with open(tmp / "0020_pred_labels.pkl", "wb") as f:
-            pickle.dump(labels, f)
+        pred_dict = {
+            "pred_boxes": boxes64,
+            "pred_scores": scores64,
+            "pred_labels": np.zeros(3, dtype=np.float64),
+            "restore": False,
+            "original_size_of_raw_data": np.array([100, 200, 300], dtype=np.int64),
+            "itk_origin": np.zeros(3, dtype=np.float64),
+            "itk_spacing": np.ones(3, dtype=np.float64),
+            "itk_direction": np.eye(3, dtype=np.float64).ravel(),
+        }
+        with open(tmp / "0020_boxes.pkl", "wb") as f:
+            pickle.dump(pred_dict, f)
 
         result = parse_predictions_dir(tmpdir)
 
@@ -334,15 +504,22 @@ def test_parse_predictions_dir_boxes_dtype_coerced_to_float32() -> None:
     assert rd.scores.dtype == np.float32
 
 
-def test_parse_predictions_dir_non_pred_boxes_files_ignored() -> None:
-    """Files that are not *_pred_boxes.pkl are ignored by the parser."""
+def test_parse_predictions_dir_non_boxes_files_ignored() -> None:
+    """Files that are not *_boxes.pkl are ignored by the parser.
+
+    Regression guard: *_pred_boxes.pkl (old wrong schema) must also be ignored.
+    Only *_boxes.pkl triggers case discovery.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        _write_per_key_pkls(tmp, "0001", n_dets=2)
+        _write_consolidated_pkl(tmp, "0001", n_dets=2)
         # These must be ignored
         (tmp / "0002_scores.npy").write_bytes(b"dummy")
         (tmp / "README.txt").write_text("hello")
-        (tmp / "0003_pred_labels.pkl").write_bytes(b"dummy")  # no matching _pred_boxes
+        (tmp / "0003_pred_labels.pkl").write_bytes(b"dummy")
+        # Old per-key schema files must NOT be picked up
+        (tmp / "0004_pred_boxes.pkl").write_bytes(b"dummy")
+        (tmp / "0005_pred_scores.pkl").write_bytes(b"dummy")
 
         result = parse_predictions_dir(tmpdir)
 
@@ -414,15 +591,22 @@ def test_predict_oof_calls_predict_dir_with_real_signature(monkeypatch: pytest.M
                 "save_state": save_state,
             }
         )
-        # Write synthetic per-key output so parse_predictions_dir can run
+        # Write synthetic consolidated output so parse_predictions_dir can run
+        # Real schema (server-verified 2026-06-23, commit 97a58f3): one dict per case
         target_path = Path(target_dir)
         for cid_str in case_ids or []:
-            boxes = np.array([[1.0, 2.0, 3.0, 4.0, 0.0, 1.0]], dtype=np.float32)
-            scores = np.array([0.9], dtype=np.float32)
-            with open(target_path / f"{cid_str}_pred_boxes.pkl", "wb") as f:
-                pickle.dump(boxes, f)
-            with open(target_path / f"{cid_str}_pred_scores.pkl", "wb") as f:
-                pickle.dump(scores, f)
+            pred_dict = {
+                "pred_boxes": np.array([[1.0, 2.0, 3.0, 4.0, 0.0, 1.0]], dtype=np.float32),
+                "pred_scores": np.array([0.9], dtype=np.float32),
+                "pred_labels": np.array([0.0], dtype=np.float32),
+                "restore": False,
+                "original_size_of_raw_data": np.array([100, 200, 300], dtype=np.int64),
+                "itk_origin": np.zeros(3, dtype=np.float64),
+                "itk_spacing": np.ones(3, dtype=np.float64),
+                "itk_direction": np.eye(3, dtype=np.float64).ravel(),
+            }
+            with open(target_path / f"{cid_str}_boxes.pkl", "wb") as f:
+                pickle.dump(pred_dict, f)
 
     fake_cfg: dict[str, object] = {"module": "TestModule", "model_cfg": {}, "trainer_cfg": {}}
     fake_plan: dict[str, object] = {"inference_plan": {}}
