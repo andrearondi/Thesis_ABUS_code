@@ -1,36 +1,53 @@
 #!/usr/bin/env python
-"""Server CLI: OOF + ensemble candidate generation (STORY_01_02, D01.14).
+"""Server CLI: OOF + ensemble candidate generation (STORY_01_02, D01.17).
 
-D01.14 redesign: branch (a) (consolidated nndet_predict -f -1) is ABANDONED
-for candidate generation because the CLI path cannot extract FPN embeddings.
-BOTH OOF (train split) and ensemble (val/test split) now use the per-fold
-feature-extracting inference wrapper: predict_with_embeddings.
+D01.17 redesign (DECOUPLED): RETIRED the hand-rolled predict_with_embeddings per-tile
+loop that caused three production failures (CPU execution, 64 GB OOM, O(N²) WBC hang).
+REPLACED with a two-step DECOUPLED design:
+
+  Step 1 — NATIVE BOXES: predict_oof(fold, case_ids, preprocessed_dir, fold_dir,
+                                     restore=False) via nnDetection's untouched predict_dir.
+            → boxes + scores in PREPROCESSED space; embeddings=None. ≤100/case.
+            → recall/provenance/Gate A owned by nnDetection.
+
+  Step 2 — POST-HOC EMBEDDING: pool_embeddings_at_boxes(fold, case_id,
+                                boxes_preprocessed, preprocessed_dir, fold_dir,
+                                pooling=<operator>) via torch.nn.functional.grid_sample.
+            → (N, 128) float32; row i ↔ native box i. FPN level pinned to
+              decoder_levels[0]. RAISES RuntimeError if decoder not found (no silent zeros).
 
 Inference paths:
 
   OOF path (--splits train):
-    For each fold k in 0..4, calls predict_with_embeddings(k, oof_ids(k), ...)
-    which loads model_last, hooks model.decoder to capture FPN features, and
-    returns (boxes, scores, real 128-D embeddings) per case.
+    For each fold k in 0..4:
+      1. predict_oof(k, oof_ids(k), imagesTr, fold_dir_k, restore=False) → native boxes.
+      2. pool_embeddings_at_boxes(k, case_id, those_boxes, imagesTr, fold_dir_k,
+                                   pooling=<op>) → (N, 128).
     The leakage guard in generate_oof_candidates fires BEFORE inference.
 
   Ensemble path (--splits val test):
-    For each fold k in 0..4, calls predict_with_embeddings(k, val_test_ids, ...)
+    For each fold k in 0..4 and for each val/test case:
+      1. predict_oof(k, val_test_ids, imagesTs, fold_dir_k, restore=False)
+      2. pool_embeddings_at_boxes(k, case_id, those_boxes, imagesTs, fold_dir_k,
+                                   pooling=<op>)
     Then ensemble_combine(per_case_proposals) across folds:
-      union → IoU-cluster → score-weighted average of boxes AND embeddings.
+      union → IoU-cluster → score+embedding-weighted average.
     source_detectors for each candidate = set of fold ids in its cluster (1..5).
-    This is genuine per-cluster fold provenance (D01.14 restores D01.12-era intent).
 
-Embedding design (D01.14):
-  - Hook point: model.decoder forward output (features_maps_all)
-  - FPN level: decoder_levels[0] (finest detection level, largest spatial res)
-  - Pooling: point-at-centroid trilinear interpolation (point_pool_trilinear)
-  - D_EMB = 128 (fpn_channels=128, pinned)
-  - Config: configs/detect/embedding_extraction.yaml
+  Run both --pooling centroid AND --pooling roi_align separately before Job 3d
+  (the discriminativeness audit, STORY_01_04), which selects the operator.
+
+Pooling operator governance (D01.17 frozen selection rule):
+  Run embedding_discriminativeness for BOTH operators on the OOF set (BEFORE
+  any H1/H2/H3 evaluation). Select:
+    roi_align if roi_align.embedding_auc > centroid.embedding_auc + 0.0
+    centroid  otherwise (ties → centroid = thesis §3.2.3 default)
+  The selected operator is written to embedding_extraction.yaml and frozen.
+  Do NOT select the operator based on H1/H2/H3 outcomes.
 
 nnDetection 0.1 surface used (commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5):
   nndet_train <TASK> -o exp.fold=N --sweep   (training; see train_all_folds.py)
-  predict_dir(case_ids=...)                  (Python helper; loaded by predict_with_embeddings)
+  predict_dir(case_ids=..., restore=False)   (Python helper; called by predict_oof)
   load_final_model(identifier="last")        (SWA model_last — pre-registered, D01.13)
 
 Env-var contract (lowercase — nnDetection reads these via os.environ):
@@ -47,6 +64,7 @@ Leakage control (thesis §3.2.1, §3.2.6):
 
 Serialisation:
   <out_dir>/<split>_candidates.npz + <split>_candidates.json
+  (per operator; re-run with --pooling centroid and --pooling roi_align separately)
 
 After generation, provenance_check is run and the summary table + embedding
 variance gap are printed. Pass --provenance-check <out_dir> to re-run the
@@ -84,8 +102,10 @@ from abus.detect.nndet_inference import (
     D_EMB,
     RawDetections,
     RawDetectionsWithEmb,
-    predict_with_embeddings,
+    pool_embeddings_at_boxes,
+    predict_oof,
     preprocess_val_test,
+    restore_boxes_for_case,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,7 +120,7 @@ NNDET_COMMIT = "97a58f3110b71caf1b4bcc1851e67cf11e987fc5"
 
 
 # ---------------------------------------------------------------------------
-# OOF inference function (per fold via predict_oof Python helper)
+# OOF inference function (D01.17: decoupled predict_oof + pool_embeddings_at_boxes)
 # ---------------------------------------------------------------------------
 
 
@@ -108,16 +128,16 @@ def _make_oof_inference_fn(
     fold: int,
     preprocessed_dir: str,
     fold_dir: str,
+    pooling: str = "centroid",
 ) -> Callable[[list[int]], list[RawCandidate]]:
-    """Return an inference callable for OOF generation using predict_with_embeddings.
+    """Return an inference callable for OOF generation using the D01.17 decoupled design.
 
-    D01.14: uses predict_with_embeddings (not predict_oof) so that each OOF
-    candidate carries a real 128-D FPN backbone embedding.
+    D01.17: uses predict_oof(restore=False) for native boxes then
+    pool_embeddings_at_boxes for post-hoc embeddings. The two steps are
+    decoupled: native inference is nnDetection-untouched (≤100/case, recall-maximal),
+    embedding pooling is post-hoc via torch.nn.functional.grid_sample.
 
     The callable signature: (case_ids: list[int]) -> list[RawCandidate].
-    Internally calls predict_with_embeddings(fold, case_ids, preprocessed_dir, fold_dir)
-    which loads model_last, hooks model.decoder, pools embeddings from
-    decoder_levels[0] (finest FPN level), and returns RawDetectionsWithEmb.
 
     Parameters
     ----------
@@ -130,22 +150,59 @@ def _make_oof_inference_fn(
         Path to fold's training output (contains config.yaml + plan_inference.pkl +
         model_last.ckpt).
         e.g. ``$det_models/Task001_TDSCABUS/RetinaUNetV001_D3V001_3d/fold<N>``
+    pooling : str
+        Pooling operator: "centroid" (default) or "roi_align" (audit-selected).
     """
 
     def inference_fn(case_ids: list[int]) -> list[RawCandidate]:
-        """Run fold-``fold`` detector on ``case_ids`` via predict_with_embeddings (D01.14)."""
-        # predict_with_embeddings returns dict[int, RawDetectionsWithEmb] keyed by case_id
-        raw_dets = predict_with_embeddings(
+        """D01.17/D01.18: native boxes → post-hoc embeddings → restore → RawCandidate list.
+
+        Two-frame design (D01.18):
+          boxes_preprocessed → pool_embeddings_at_boxes (storage frame = FPN frame)
+          boxes_preprocessed → restore_boxes_for_case   (original-grid frame for BBox)
+        Both frames come from the SAME predict_oof(restore=False) call; pairing is 1:1 by row.
+        """
+        # Step 1: NATIVE BOXES — untouched nnDetection, ≤100/case, preprocessed space
+        raw_dets = predict_oof(
             fold=fold,
             case_ids=case_ids,
             preprocessed_dir=preprocessed_dir,
             fold_dir=fold_dir,
+            restore=False,  # D01.17: boxes in preprocessed space (= FPN space)
         )
 
         candidates: list[RawCandidate] = []
-        for _case_id, rd in raw_dets.items():
+        for case_id, rd in raw_dets.items():
+            # Step 2: POST-HOC EMBEDDING — pool at each native box (storage frame)
+            emb = pool_embeddings_at_boxes(
+                fold=fold,
+                case_id=case_id,
+                boxes_preprocessed=rd.boxes,
+                preprocessed_dir=preprocessed_dir,
+                fold_dir=fold_dir,
+                pooling=pooling,
+            )
+
+            # Step 3: RESTORE — convert storage-frame boxes to original-grid frame (D01.18).
+            # _raw_detections_to_candidates expects RESTORED boxes (slot0→d0, slot4→d2).
+            # The embedding (step 2) was pooled from storage-frame boxes and does not
+            # change — embeddings are opaque 128-D vectors, not spatial coordinates.
+            boxes_original = restore_boxes_for_case(
+                boxes_preprocessed=rd.boxes,
+                case_id=case_id,
+                preprocessed_dir=preprocessed_dir,
+                fold_dir=fold_dir,
+            )
+
+            # Attach embeddings to RESTORED boxes
+            rd_with_emb = RawDetectionsWithEmb(
+                case_id=case_id,
+                boxes=boxes_original,  # D01.18: original-grid frame for BBox
+                scores=rd.scores,
+                embeddings=emb,
+            )
             candidates.extend(
-                _raw_detections_to_candidates(rd, split="train", source_detectors=(fold,))
+                _raw_detections_to_candidates(rd_with_emb, split="train", source_detectors=(fold,))
             )
         return candidates
 
@@ -221,23 +278,30 @@ def _raw_detections_to_candidates(
     zero-placeholder of D01.13 is retired; the candidate stage now always
     uses predict_with_embeddings which produces real embeddings).
 
-    Box axis (D01.13 confirmed): (x1, y1, x2, y2, z1, z2)
-    Project axis vocabulary (EPIC_00 C1): x↔d2, y↔d1, z↔d0
+    Box axis (D01.18 two-frame design): rd.boxes MUST be in ORIGINAL-IMAGE-GRID
+    space (produced by ``restore_boxes_for_case``).
 
-    Boxes are in nnDetection's resampled-grid convention. The
-    grid→original conversion is deferred to STORY_01_04.
+    After restore_detection, the column format is ``(x1, y1, x2, y2, z1, z2)``
+    where x/y/z refer to the ORIGINAL storage axes: x=d0, y=d1, z=d2.
+    This is nnDetection's documented output convention (detection.py:263).
+    The slot→axis mapping is therefore: x1=slot0→d0, y1=slot1→d1, z1=slot4→d2.
+
+    Do NOT pass storage-frame (preprocessed-space) boxes — those are for
+    ``pool_embeddings_at_boxes``. STORY_01_03 IoU-matches the BBox against
+    original-grid GT lesion bboxes (thesis §3.2.2/§3.2.9).
     """
     import numpy as np
 
     from abus.geometry.bbox import BBox
 
-    # D01.14: embeddings must not be None — the zero-placeholder is retired.
+    # D01.14/D01.17: embeddings must not be None — the zero-placeholder is retired.
     if rd.embeddings is None:
         raise ValueError(
             f"_raw_detections_to_candidates: rd.embeddings is None for case_id={rd.case_id}. "
-            "D01.14 requires real (N, D_EMB) embeddings from predict_with_embeddings. "
+            "D01.17 requires real (N, D_EMB) embeddings from pool_embeddings_at_boxes. "
             "Do not pass RawDetections (CLI per-key schema) to this function — "
-            "use predict_with_embeddings which returns RawDetectionsWithEmb with real embeddings."
+            "use predict_oof then pool_embeddings_at_boxes which returns a RawDetectionsWithEmb "
+            "with real embeddings (D01.17 decoupled design)."
         )
 
     candidates: list[RawCandidate] = []
@@ -246,8 +310,13 @@ def _raw_detections_to_candidates(
         return candidates
 
     for i in range(rd.boxes.shape[0]):
-        # D01.13/D01.14 confirmed box axis: (x1, y1, x2, y2, z1, z2)
-        # Source: nndet/core/boxes/ops.py line 34, detection.py _apply_offsets_to_boxes
+        # D01.18: boxes are RESTORED — output of restore_detection.
+        # nnDetection documents restore_detection output as (x1,y1,x2,y2,z1,z2)
+        # in ORIGINAL image space (detection.py:263).  After restore, x/y/z map
+        # back to original storage axes: x=d0, y=d1, z=d2.
+        # Source: restore.py:54 permute_boxes(boxes, transpose_backward) undoes
+        # transpose_forward, so original axis 0 → slot 0 (x), axis 1 → slot 1 (y),
+        # axis 2 → slot 4 (z).
         box = rd.boxes[i]
         x1, y1, x2, y2, z1, z2 = (int(round(float(v))) for v in box)
 
@@ -265,15 +334,15 @@ def _raw_detections_to_candidates(
             )
             continue
 
-        # Map (x1,y1,x2,y2,z1,z2) → project BBox (min_d0,min_d1,min_d2,max_d0,max_d1,max_d2)
-        # z→d0, y→d1, x→d2
+        # Map restored (x1,y1,x2,y2,z1,z2) → project BBox
+        # x=d0, y=d1, z=d2  (original storage-axis order, post-restore)
         bbox = BBox(
-            min_d0=z1,
+            min_d0=x1,
             min_d1=y1,
-            min_d2=x1,
-            max_d0=max(z2, z1 + 1),
+            min_d2=z1,
+            max_d0=max(x2, x1 + 1),
             max_d1=max(y2, y1 + 1),
-            max_d2=max(x2, x1 + 1),
+            max_d2=max(z2, z1 + 1),
         )
 
         emb = rd.embeddings[i].astype(np.float32)
@@ -325,45 +394,46 @@ def _generate_ensemble_with_embeddings(
     split_case_ids: dict[str, list[int]],
     preprocessed_ts_dir: str,
     nndet_commit: str,
+    pooling: str = "centroid",
 ) -> dict[str, RawCandidateSet]:
-    """D01.14 per-fold embedding-extracting ensemble path.
+    """D01.17 DECOUPLED per-fold ensemble path.
 
-    For each of the 5 fold detectors:
-      1. Call predict_with_embeddings(fold, all_val_test_case_ids, ...)
-         which loads model_last, hooks model.decoder, and returns
-         RawDetectionsWithEmb (boxes + scores + real 128-D embeddings) per case.
-      2. Convert to RawCandidate list with source_detectors=(fold,).
-      3. Collect proposals per case across all 5 folds.
+    For each of the 5 fold detectors and each val/test case:
+      1. Native boxes: predict_oof(fold, case_ids, imagesTs, fold_dir, restore=False)
+         — untouched nnDetection, ≤100/case, preprocessed space.
+      2. Post-hoc embedding: pool_embeddings_at_boxes(fold, case_id, those_boxes,
+         imagesTs, fold_dir, pooling=<op>) → (N, 128) float32.
+      3. Convert to RawCandidate list with source_detectors=(fold,).
+      4. Collect proposals per case across all 5 folds.
     Then for each case:
-      4. ensemble_combine(per_case_proposals) → union + IoU-cluster +
-         score-weighted average of boxes AND embeddings.
-         source_detectors = set of fold ids in each cluster (1..5, genuine).
+      5. ensemble_combine(per_case_proposals) → union + IoU-cluster +
+         score+embedding-weighted average. source_detectors = set of fold ids
+         from each cluster (1..5, genuine).
 
-    This is the D01.14 replacement for branch-(a) + the D01.13 branch-(b) fallback.
-    It produces:
-      - Real 128-D embeddings per candidate (not zeros).
-      - Genuine per-cluster fold provenance (1..5 source_detectors).
-      - Recall-maximal candidates (high-recall ensembler defaults from D01.13 point 6).
+    D01.17 replaces the retired predict_with_embeddings per-tile loop that caused
+    three production failures. The decoupled design eliminates:
+      - CPU execution (predict_oof delegates to nnDetection's GPU-aware predictor)
+      - OOM (no tiling needed for embedding pooling — one forward per case, not tile)
+      - O(N²) WBC hang (predict_oof uses ≤100/case, not per-tile thousands)
 
     D01.14b: val/test preprocessed files are in imagesTs (NOT imagesTr).
     imagesTr contains only the 100 training cases (0000-0099). The val/test cases
     (0100-0199) must be preprocessed separately via preprocess_val_test into
     preprocessed/<data_identifier>/imagesTs/ before this function is called.
-    preprocessed_ts_dir must point to that imagesTs directory.
 
     Parameters
     ----------
     preprocessed_ts_dir : str
-        Path to the preprocessed imagesTs directory containing .npz files for the
+        Path to the preprocessed imagesTs directory containing .npz files for
         val/test cases. Populated by preprocess_val_test before this call.
         e.g. ``$det_data/Task001_TDSCABUS/preprocessed/D3V001_3d/imagesTs``
+    pooling : str
+        Pooling operator: "centroid" (default) or "roi_align". Audit-selected.
     """
     all_splits = list(split_case_ids.keys())
     all_case_ids = sorted({cid for ids in split_case_ids.values() for cid in ids})
 
-    # D01.14b guard: the imagesTs directory must exist and be non-empty.
-    # A missing or empty dir means preprocess_val_test was not called — fail early
-    # with a clear error rather than silently producing zero val/test candidates.
+    # D01.14b guard: imagesTs must exist before ensemble
     ts_path = Path(preprocessed_ts_dir)
     if not ts_path.exists():
         raise FileNotFoundError(
@@ -379,23 +449,55 @@ def _generate_ensemble_with_embeddings(
     for fold in range(5):
         fold_dir = str(Path(det_models_root) / task_name / exp_id / f"fold{fold}")
         print(
-            f"  Fold {fold}: running predict_with_embeddings for "
+            f"  Fold {fold}: predict_oof (native boxes) for "
             f"{len(all_case_ids)} val/test cases ..."
         )
 
-        # D01.14: use predict_with_embeddings to get real embeddings
-        # D01.14b: source dir is imagesTs (not imagesTr — training-only)
-        raw_dets = predict_with_embeddings(
+        # Step 1: NATIVE BOXES — untouched nnDetection, preprocessed space
+        raw_dets = predict_oof(
             fold=fold,
             case_ids=all_case_ids,
             preprocessed_dir=preprocessed_ts_dir,
             fold_dir=fold_dir,
+            restore=False,  # D01.17: boxes in preprocessed space
+        )
+
+        print(
+            f"  Fold {fold}: pool_embeddings_at_boxes ({pooling}) for " f"{len(raw_dets)} cases ..."
         )
 
         for case_id, rd in raw_dets.items():
+            # Step 2: POST-HOC EMBEDDING — pool at each native box (storage frame)
+            emb = pool_embeddings_at_boxes(
+                fold=fold,
+                case_id=case_id,
+                boxes_preprocessed=rd.boxes,
+                preprocessed_dir=preprocessed_ts_dir,
+                fold_dir=fold_dir,
+                pooling=pooling,
+            )
+
+            # Step 3: RESTORE — convert storage-frame boxes to original-grid frame (D01.18).
+            # _raw_detections_to_candidates expects RESTORED boxes (slot0→d0, slot4→d2)
+            # so the BBox is in original-grid space (required by STORY_01_03 GT matching).
+            boxes_original = restore_boxes_for_case(
+                boxes_preprocessed=rd.boxes,
+                case_id=case_id,
+                preprocessed_dir=preprocessed_ts_dir,
+                fold_dir=fold_dir,
+            )
+
+            # Attach embeddings to RESTORED boxes (D01.18: original-grid frame for BBox)
+            rd_with_emb = RawDetectionsWithEmb(
+                case_id=case_id,
+                boxes=boxes_original,  # D01.18: original-grid frame
+                scores=rd.scores,
+                embeddings=emb,
+            )
+
             # Per-fold source_detectors = (fold,); ensemble_combine will merge them
             fold_candidates = _raw_detections_to_candidates(
-                rd, split="ens_tmp", source_detectors=(fold,)
+                rd_with_emb, split="ens_tmp", source_detectors=(fold,)
             )
             proposals_by_case.setdefault(case_id, []).extend(fold_candidates)
 
@@ -518,19 +620,26 @@ def main() -> None:
         default=NNDET_COMMIT,
         help="nnDetection commit hash (for reproducibility).",
     )
-    # D01.14: --ensemble-branch argument retired. Branch (a) (consolidated
-    # nndet_predict -f -1) is abandoned for candidate-gen because it cannot
-    # extract FPN embeddings. The only supported path is per-fold
-    # predict_with_embeddings + ensemble_combine.
-    # The argument is kept with a single accepted value for backward-compat
-    # of any existing scripts that pass --ensemble-branch; it is a no-op.
+    parser.add_argument(
+        "--pooling",
+        choices=["centroid", "roi_align"],
+        default="centroid",
+        help=(
+            "D01.17: pooling operator for post-hoc embedding extraction. "
+            "'centroid' = single trilinear sample at box centroid (thesis §3.2.3 default). "
+            "'roi_align' = 3D RoIAlign of box extent → 1x1x1 (§3.2.3 contingency). "
+            "Run BOTH operators before the discriminativeness audit (Job 3d, STORY_01_04). "
+            "Do NOT select based on H1/H2/H3 outcomes (D01.17 researcher-DoF firewall)."
+        ),
+    )
+    # --ensemble-branch retired; kept for backward-compat of existing call-sites (no-op)
     parser.add_argument(
         "--ensemble-branch",
         choices=["embedding"],
         default="embedding",
         help=(
-            "D01.14: only 'embedding' (per-fold predict_with_embeddings + ensemble_combine) "
-            "is supported. Branch (a) (consolidated nndet_predict -f -1) is retired."
+            "D01.17 (formerly D01.14): only 'embedding' path supported. "
+            "Retained as a no-op for backward-compat."
         ),
     )
     parser.add_argument(
@@ -619,11 +728,12 @@ def main() -> None:
             # The leakage guard in generate_oof_candidates fires BEFORE inference
             # (ASC-01_02.7). It raises ProvenanceError if any case_ids are
             # in train_ids(fold).
-            # D01.13: predict_oof now takes preprocessed_dir + fold_dir (real signature)
+            # D01.17: decoupled design — predict_oof(restore=False) + pool_embeddings_at_boxes
             inference_fn = _make_oof_inference_fn(
                 fold=fold_id,
                 preprocessed_dir=preprocessed_dir,
                 fold_dir=fold_dir,
+                pooling=args.pooling,
             )
 
             fold_candidates = generate_oof_candidates(
@@ -648,12 +758,15 @@ def main() -> None:
         candidate_sets["train"] = train_set
 
     # -----------------------------------------------------------------------
-    # Ensemble generation (val + test splits) — D01.14 per-fold embedding path
+    # Ensemble generation (val + test splits) — D01.17 decoupled path
     # -----------------------------------------------------------------------
     ens_splits = [s for s in ("val", "test") if s in args.splits]
     if ens_splits:
         print("\n=== Ensemble candidate generation (val + test splits) ===")
-        print("D01.14: using per-fold predict_with_embeddings + ensemble_combine")
+        print(
+            f"D01.17: decoupled predict_oof(restore=False) + "
+            f"pool_embeddings_at_boxes({args.pooling})"
+        )
         print("        (real 128-D embeddings; genuine 1..5 source_detectors)")
         print("D01.14b: preprocessing val/test cases into imagesTs first ...")
 
@@ -676,6 +789,7 @@ def main() -> None:
             split_case_ids=requested_split_ids,
             preprocessed_ts_dir=preprocessed_ts_dir,
             nndet_commit=args.nndet_commit,
+            pooling=args.pooling,
         )
         print("D01.14b ensemble generation complete.")
 

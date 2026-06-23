@@ -1,57 +1,126 @@
-# Frozen backbone-embedding extraction configuration (D01.14, 2026-06-04)
+# Frozen backbone-embedding extraction configuration (D01.17, 2026-06-22)
+# SUPERSEDES the D01.14 version (hand-rolled per-tile loop, retired after 3 failures).
 #
 # This config is FROZEN. Any change requires a new decision-log entry and a
 # re-run of all candidate generation jobs, since the embedding is the principal
-# GNN node feature and changes it downstream to the graph, GNN training, and
+# GNN node feature and changes flow downstream to the graph, GNN training, and
 # all pre-registered hypothesis tests (H1/H2/H3).
 #
 # Recorded in every RawCandidateSet for reproducibility (agent_rules §12).
 #
+# DESIGN (D01.17 — DECOUPLED):
+#   1. Candidate boxes-of-record come from nnDetection's UNTOUCHED native inference
+#      (predict_oof / predict_dir, restore=False) — high-recall defaults frozen,
+#      ≤100 boxes/case. The box owns recall/provenance/Gate A; nnDetection owns it.
+#   2. The 128-D embedding is pooled POST-HOC from the Retina U-Net's own FPN
+#      decoder feature maps at those native final boxes, in case-PREPROCESSED space
+#      (restore=False), via a dependency-free torch.nn.functional.grid_sample operator.
+#   3. Level is PINNED to decoder_levels[0] (NOT the anchor level): the native final
+#      box is a match_scores-weighted AVERAGE of its WBC cluster members
+#      (wbc.py:197), so it corresponds to no single anchor and has NO recoverable
+#      anchor level (retina.py:367 anchor_idxs is destroyed inside inference_step).
+#      The embedding is "the FPN response at the consensus detection centroid" —
+#      an explicit approximation, NOT the detector's per-anchor feature.
+#
 # Source grounding: nnDetection 0.1 commit 97a58f3110b71caf1b4bcc1851e67cf11e987fc5
-#   - Hook target: model.decoder  (retina.py:219 — features_maps_all = self.decoder(...))
+#   - Hook target: model.model.decoder (retina.py:219 — features_maps_all = self.decoder(...);
+#       on the Lightning module the network is at model.model, decoder at model.model.decoder)
 #   - FPN output: list of tensors [C, D0, D1, D2] per level
 #   - fpn_channels: 128  (build log "fpn channels: 128"; base.py:528)
-#   - decoder_levels: read from plan_arch["decoder_levels"] at inference time
+#   - decoder_levels: read from the model object at inference time (default (2,3,4,5))
 #   - Level index 0: decoder_levels[0] = finest detection FPN level (largest spatial res)
+#   - Per-axis stride = patch_size / feature_map_size (anchors.py:225; anisotropic)
+#   - Native inference autocast: torch.cuda.amp.autocast() (predictor.py:305) — the
+#       post-hoc pooling forward MUST replicate this so feature-map dtype matches the
+#       box-producing forward.
 
 # Pinned embedding dimension (fpn_channels = 128)
 d_emb: 128
 
-# Hook target module attribute path on the loaded model object
-hook_target: "decoder"
+# Hook target module attribute path on the loaded model object.
+# RAISE if not found — a missing hook is a build error, NEVER all-zero embeddings
+# (D01.17 inversion failure path #2; the D01.14 silent zero-fill fallback is REMOVED).
+hook_target: "model.decoder"   # resolved as model.model.decoder, falling back to model.decoder
 
-# Which element of features_maps_all to pool from (0 = finest detection FPN level)
-# decoder_levels[0] is the finest level, giving the least-lossy point sample.
+# Which element of features_maps_all to pool from (0 = finest detection FPN level).
+# PINNED (D01.17): the consensus-averaged box has no anchor level, so the level is fixed
+# for ALL boxes, not recovered per-detection. Removes the phantom-level degree of freedom.
 fpn_level_index: 0
 
-# Pooling method: point-at-centroid trilinear interpolation
-# Implements thesis §3.2.3 "default pooled embedding"
-# The §3.2.3 contingency (RoI-Align) is NOT implemented here; it is invoked only
-# if STORY_01_04's embedding_discriminativeness shows embedding_auc ≤ confidence_auc.
-pooling_method: "point"
-interpolation: "trilinear"
+# -----------------------------------------------------------------------------
+# Pooling operator — AUDIT-SELECTED (D01.17, user-authorized)
+# -----------------------------------------------------------------------------
+# Both operators are implemented and produce a native 128-D vector via the SAME
+# grid_sample operator. The DEFAULT is chosen by a PRE-SPECIFIED, OUTCOME-INDEPENDENT
+# discriminativeness audit (STORY_01_04 embedding_discriminativeness on the OOF set),
+# NOT by which yields better H1/H2/H3 results (that would invalidate the pre-registration).
+#
+#   centroid  : single trilinear sample at the box centroid (thesis §3.2.3 default;
+#               = the legacy point_pool_trilinear). Maximally faithful to the
+#               detector's firing location.
+#   roi_align : 3D RoIAlign of the box EXTENT → 1x1x1 (mean of a regular grid over the
+#               box, trilinear-sampled). Extent-aware (SOTA memo §A2/§F). Thesis §3.2.3
+#               pre-registers this as the contingency; the user authorized it to become
+#               the DEFAULT if it wins the audit.
+#
+# SELECTION RULE (frozen):
+#   Run embedding_discriminativeness for BOTH operators on the pooled OOF candidate set
+#   (both pooled from the SAME native boxes in the SAME pass-consistent frame, so only
+#   the operator differs). Let δ_audit = 0.0.
+#     default = roi_align  IF  roi_align.embedding_auc > centroid.embedding_auc + δ_audit
+#     default = centroid   OTHERWISE  (ties → centroid = the thesis default; avoids churn)
+#   The chosen operator is written to `pooling_method` below, frozen, and recorded in
+#   every RawCandidateSet. If the audit flips the default to roi_align, all candidate
+#   sets are re-pooled with pooling="roi_align" and a /write-thesis update to §3.2.3 is
+#   triggered (D01.17 thesis-fidelity follow-up).
+pooling_method: "centroid"   # default of record until the audit selects; see SELECTION RULE
+delta_audit: 0.0
 
-# Coordinate mapping (D01.14, D01.13, D01.7, EPIC_00 C1):
+# RoIAlign sampling grid (roi_align mode only): regular grid of sample points placed
+# inside the box extent, trilinear-sampled, then mean-pooled to 1x1x1 → (C,).
+# (3,3,3) = 27 samples; cheap and adequate for small ABUS lesions. He et al. 2017 show
+# the exact sample count barely matters once misalignment is removed (SOTA memo §A2).
+roi_align_grid: [3, 3, 3]
+
+# grid_sample convention (D01.17 — pinned + golden-impulse + differential unit-tested):
+#   - 5D input  : feat_map (1, C, D0, D1, D2)
+#   - grid      : normalized coords in [-1, 1]; the LAST grid component indexes the
+#                 FIRST-varying spatial axis (W = innermost = d2 = x), i.e. grid (..,3)
+#                 ordered (x_norm, y_norm, z_norm) = (d2, d1, d0).
+#   - align_corners: False  (voxel centre at -1 + (2*i+1)/D); pinned so a half-voxel
+#                 shift cannot silently corrupt every sample. The differential test
+#                 asserts grid_pool(centroid) == point_pool_trilinear to 1e-5.
+grid_sample_align_corners: false
+
+# Coordinate mapping (D01.17, D01.13, D01.7, EPIC_00 C1):
 #   nnDetection box axis: (x1, y1, x2, y2, z1, z2)
 #     where x = storage axis d2 (elevational, 0.500 mm after D01.7)
 #           y = storage axis d1 (lateral,    0.300 mm after D01.7)
 #           z = storage axis d0 (acoustic depth, 0.300 mm after D01.7)
 #   Feature map tensor axes: [C, d0, d1, d2]
-#   Centroid → feature map axes:
+#   Centroid → feature-map voxel coords (then ÷ per-axis stride into feature space):
 #     cx_d0 = (z1 + z2) / 2   → tensor axis 1
 #     cx_d1 = (y1 + y2) / 2   → tensor axis 2
 #     cx_d2 = (x1 + x2) / 2   → tensor axis 3
 box_axis: "(x1, y1, x2, y2, z1, z2)"
-tta_frame_note: >
-  The hook fires per tile per TTA pass (in tile-pixel space). Box centroid
-  is adjusted to tile-local space by subtracting tile_origin before pooling.
-  See predict_with_embeddings in nndet_inference.py for the full implementation.
 
-# TTA (test-time augmentation): nnDetection 0.1 default (4 transforms)
-# The TTA inverse is applied to box coordinates by nnDetection before we receive them.
-# Embeddings are pooled from the per-tile feature map in tile space, consistent with
-# the box coordinates in that tile's frame.
-num_tta_transforms: 4
+# Coordinate frame for pooling: PREPROCESSED / resampled (restore=False).
+# The native boxes-of-record are fetched with restore=False so they live in the SAME
+# space as the FPN feature maps; restore_detection's affine (restore.py:54-66) is NEVER
+# inverted. Pooling MUST receive preprocessed-space boxes — assert at the operator entry.
+pooling_frame: "preprocessed"
+
+# Numerical-consistency requirement for the post-hoc pooling pass (D01.17 §5):
+#   The pooling pass re-tiles the SAME preprocessed case on the SAME native grid and runs
+#   the forward under the SAME autocast as the native predictor. A one-case equivalence
+#   check (re-tiled boxes match native boxes to ≤1 voxel) is a HARD pre-pooling gate.
+autocast: true
+pass_consistency_box_tol_voxels: 1.0
+
+# Cross-fold averaging (val/test, thesis §3.2.1): the per-fold embeddings are averaged
+# across the folds that contributed to each surviving WBC cluster, via the existing
+# ensemble_combine (same weights/members as the score). NO geometric re-match.
+ensemble_averaging: "cross_fold_via_ensemble_combine"
 
 # Detector checkpoint: SWA model_last (pre-registered default per thesis §3.2.3)
 # load_final_model(identifier="last") — loading.py:64

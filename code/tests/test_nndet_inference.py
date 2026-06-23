@@ -371,7 +371,7 @@ def test_predict_oof_calls_predict_dir_with_real_signature(monkeypatch: pytest.M
       - source_models = fold_dir (as Path)
       - model_fn    = partial(load_final_model, identifier="last")
       - num_models  = 1
-      - restore     = True  (restore boxes to original image space)
+      - restore     = False (D01.17: boxes in preprocessed space = same as FPN maps)
       - case_ids    = [f"{cid:04d}" for cid in case_ids]  (4-digit zero-padded strings)
       - save_state  = False
     """
@@ -472,7 +472,11 @@ def test_predict_oof_calls_predict_dir_with_real_signature(monkeypatch: pytest.M
     assert "source_dir" in called_kwargs, "predict_dir must be called"
     n_models = called_kwargs["num_models"]
     assert n_models == 1, f"num_models must be 1, got {n_models}"
-    assert called_kwargs["restore"] is True, "restore must be True (boxes in original space)"
+    assert called_kwargs["restore"] is False, (
+        "restore must be False (D01.17: boxes kept in preprocessed space, "
+        "same coordinate frame as FPN feature maps, so pool_embeddings_at_boxes "
+        "can pool without inverting restore_detection's affine)"
+    )
     assert called_kwargs["save_state"] is False, "save_state must be False"
     # case_ids must be 4-digit zero-padded strings
     assert called_kwargs["case_ids"] == [
@@ -1488,3 +1492,576 @@ def test_streaming_equivalence_under_score_ties() -> None:
         embs_s,
         err_msg="Embeddings must match under score ties",
     )
+
+
+# ===========================================================================
+# D01.17 — pool_embeddings_at_boxes tests
+# ===========================================================================
+
+
+def test_pool_embeddings_at_boxes_signature() -> None:
+    """D01.17: pool_embeddings_at_boxes must exist with the correct signature."""
+    import inspect
+
+    from abus.detect.nndet_inference import pool_embeddings_at_boxes
+
+    sig = inspect.signature(pool_embeddings_at_boxes)
+    params = list(sig.parameters.keys())
+
+    required = ["fold", "case_id", "boxes_preprocessed", "preprocessed_dir", "fold_dir"]
+    for name in required:
+        assert name in params, f"pool_embeddings_at_boxes missing required param: {name}"
+
+    # keyword-only params
+    assert "pooling" in params, "pooling must be a keyword-only param"
+    assert "fpn_level_index" in params, "fpn_level_index must be a keyword-only param"
+
+    p_pooling = sig.parameters["pooling"]
+    p_fpn = sig.parameters["fpn_level_index"]
+    assert p_pooling.kind == inspect.Parameter.KEYWORD_ONLY, "pooling must be keyword-only"
+    assert p_fpn.kind == inspect.Parameter.KEYWORD_ONLY, "fpn_level_index must be keyword-only"
+    assert (
+        p_pooling.default == "centroid"
+    ), f"pooling default must be 'centroid', got {p_pooling.default}"
+    assert p_fpn.default == 0, f"fpn_level_index default must be 0, got {p_fpn.default}"
+
+
+def test_pool_embeddings_at_boxes_raises_import_error_without_nndet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D01.17: pool_embeddings_at_boxes raises ImportError when nnDetection is not installed.
+
+    This test simulates the laptop environment where nnDetection is absent.
+    """
+    from unittest.mock import patch
+
+    import numpy as np
+
+    from abus.detect import nndet_inference
+
+    boxes = np.array([[1.0, 1.0, 3.0, 3.0, 1.0, 3.0]], dtype=np.float32)
+
+    with patch.dict(
+        "sys.modules",
+        {
+            "nndet": None,
+            "nndet.inference": None,
+            "nndet.inference.loading": None,
+            "nndet.io": None,
+            "nndet.io.load": None,
+            "nndet.io.patching": None,
+            "omegaconf": None,
+        },
+    ):  # noqa: E501
+        with pytest.raises(ImportError):
+            nndet_inference.pool_embeddings_at_boxes(
+                fold=0,
+                case_id=0,
+                boxes_preprocessed=boxes,
+                preprocessed_dir="/nonexistent",
+                fold_dir="/nonexistent",
+            )
+
+
+def test_pool_embeddings_at_boxes_predict_oof_restore_false() -> None:
+    """D01.17: predict_oof default restore=False (boxes in preprocessed space).
+
+    Verifies that predict_oof's restore parameter defaults to False per D01.17.
+    This is the cornerstone of the decoupled design: the same coordinate space
+    for both native boxes and FPN feature maps.
+    """
+    import inspect
+
+    from abus.detect.nndet_inference import predict_oof
+
+    sig = inspect.signature(predict_oof)
+    restore_param = sig.parameters.get("restore")
+    assert restore_param is not None, "predict_oof must have a 'restore' parameter (D01.17)"
+    assert restore_param.default is False, (
+        f"predict_oof restore default must be False (D01.17), got {restore_param.default}. "
+        "The D01.17 design requires boxes in preprocessed space (same as FPN feature maps) "
+        "so pool_embeddings_at_boxes can pool without inverting restore_detection's affine."
+    )
+
+
+def test_pool_embeddings_at_boxes_raises_runtime_error_without_decoder_levels(
+    tmp_path: Path,
+) -> None:
+    """D01.17 B1: pool_embeddings_at_boxes raises RuntimeError when decoder_levels is missing.
+
+    This pins the fix for ML-review Round 2 B1 (wrong decoder output level).
+    The function must resolve model.model.decoder_levels to correctly select
+    the detection-level FPN output (decoder_levels[0] ≥ 2 for ABUS volumes,
+    never output[0]).
+
+    We supply a mock model that has a decoder (so the decoder-module check passes)
+    but lacks decoder_levels (so the B1 guard fires), and confirm the RuntimeError.
+
+    Filesystem setup: create real-looking fold_dir and preprocessed_dir so that
+    the file-existence checks pass and execution reaches the decoder_levels guard.
+    """
+    import pickle
+    import sys
+    from unittest.mock import MagicMock, patch
+
+    # Create real-looking fold dir with config.yaml + plan_inference.pkl
+    fold_dir = tmp_path / "fold0"
+    fold_dir.mkdir()
+
+    # Minimal config YAML
+    (fold_dir / "config.yaml").write_text(
+        "module: RetinaUNetModule\nmodel_cfg: {}\ntrainer_cfg: {}\n"
+    )
+
+    # Minimal plan pickle: must contain patch_size
+    plan = {"patch_size": [64, 64, 64]}
+    with open(fold_dir / "plan_inference.pkl", "wb") as fh:
+        pickle.dump(plan, fh)
+
+    # Create preprocessed dir with a fake .npz for case_id=0 (0000.npz)
+    pre_dir = tmp_path / "preprocessed"
+    pre_dir.mkdir()
+    fake_arr = np.zeros((1, 64, 64, 64), dtype=np.float32)
+    np.savez(str(pre_dir / "0000.npz"), data=fake_arr)
+
+    # Build a mock model: model.model has .decoder but NO .decoder_levels
+    mock_decoder = MagicMock()
+    mock_inner = MagicMock(spec=[])  # spec=[] → no attributes by default
+    mock_inner.decoder = mock_decoder  # has .decoder
+    # does NOT have .decoder_levels (not in spec=[])
+
+    mock_model = MagicMock()
+    mock_model.model = mock_inner
+    # make model.parameters() not throw; hasattr check in code uses default_rng
+    mock_model.parameters.return_value = iter([MagicMock()])
+
+    mock_load_fn = MagicMock(return_value=[{"model": mock_model, "rank": 0}])
+
+    # Mock torch and nndet modules so lazy import succeeds
+    mock_torch = MagicMock()
+    mock_torch.cuda.is_available.return_value = False
+
+    mock_nndet_loading = MagicMock()
+    mock_nndet_loading.load_final_model = mock_load_fn
+
+    mock_nndet_io_load = MagicMock()
+    mock_nndet_io_load.load_pickle.return_value = plan  # plan_inference.pkl returns plan
+
+    mock_nndet_io_patching = MagicMock()
+    # create_grid returns empty tile list (no tiles needed; we raise before any tile)
+    mock_nndet_io_patching.create_grid.return_value = []
+    mock_nndet_io_patching.save_get_crop.return_value = (fake_arr, (0, 0, 0), None)
+
+    mock_omegaconf = MagicMock()
+    mock_omegaconf.OmegaConf.load.return_value = {}
+    mock_omegaconf.OmegaConf.to_container.return_value = {
+        "module": "RetinaUNetModule",
+        "model_cfg": {},
+        "trainer_cfg": {},
+    }
+
+    boxes = np.zeros((2, 6), dtype=np.float32)
+
+    import abus.detect.nndet_inference as nni
+
+    with patch.dict(
+        sys.modules,
+        {
+            "torch": mock_torch,
+            "nndet": MagicMock(),
+            "nndet.inference": MagicMock(),
+            "nndet.inference.loading": mock_nndet_loading,
+            "nndet.io": MagicMock(),
+            "nndet.io.load": mock_nndet_io_load,
+            "nndet.io.patching": mock_nndet_io_patching,
+            "omegaconf": mock_omegaconf,
+        },
+    ):
+        with pytest.raises(RuntimeError, match="decoder_levels"):
+            nni.pool_embeddings_at_boxes(
+                fold=0,
+                case_id=0,
+                boxes_preprocessed=boxes,
+                preprocessed_dir=str(pre_dir),
+                fold_dir=str(fold_dir),
+            )
+
+
+# ===========================================================================
+# D01.18 — restore_boxes_for_case tests (two-frame design)
+# ===========================================================================
+
+
+def test_restore_boxes_for_case_signature() -> None:
+    """D01.18: restore_boxes_for_case is importable with the correct signature.
+
+    The function converts storage-frame boxes from predict_oof(restore=False)
+    to original-image-grid boxes for the RawCandidate.bbox (required by
+    STORY_01_03 GT matching against original-grid GT lesion bboxes).
+    """
+    import inspect
+
+    from abus.detect.nndet_inference import restore_boxes_for_case
+
+    sig = inspect.signature(restore_boxes_for_case)
+    params = list(sig.parameters.keys())
+
+    required = ["boxes_preprocessed", "case_id", "preprocessed_dir", "fold_dir"]
+    for name in required:
+        assert name in params, f"restore_boxes_for_case missing required param: {name}"
+
+
+def test_restore_boxes_for_case_raises_import_error_on_laptop() -> None:
+    """D01.18: restore_boxes_for_case raises ImportError on laptop (nnDetection not installed).
+
+    The function is server-only (requires nndet.inference.restore and nndet.io.load).
+    The lazy-import guard must fire before any file-system access.
+    """
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from abus.detect import nndet_inference
+
+    boxes = np.zeros((2, 6), dtype=np.float32)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fold_dir = Path(tmpdir) / "fold0"
+        fold_dir.mkdir()
+        pre_dir = Path(tmpdir) / "preprocessed"
+        pre_dir.mkdir()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "nndet": None,
+                "nndet.inference": None,
+                "nndet.inference.restore": None,
+                "nndet.io": None,
+                "nndet.io.load": None,
+            },
+        ):
+            with pytest.raises(ImportError):
+                nndet_inference.restore_boxes_for_case(
+                    boxes_preprocessed=boxes,
+                    case_id=0,
+                    preprocessed_dir=str(pre_dir),
+                    fold_dir=str(fold_dir),
+                )
+
+
+def test_restore_boxes_for_case_applies_identity_transform() -> None:
+    """D01.18: restore_boxes_for_case applies nnDetection restore_detection correctly.
+
+    With identity transpose_backward=[0,1,2] and uniform spacing
+    (original_spacing == spacing_after_resampling), the restored boxes
+    equal the input boxes (no scaling or permutation).
+
+    This pins the two-frame contract:
+      - storage-frame boxes → pool_embeddings_at_boxes (unchanged, FPN frame)
+      - same boxes → restore_boxes_for_case → original-grid boxes for BBox
+    When the transform is identity, both frames coincide (as a sanity check).
+    """
+    import pickle
+    import sys
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    from abus.detect import nndet_inference
+
+    # Identity plan: transpose_backward=[0,1,2] (no permutation)
+    plan = {
+        "patch_size": [64, 64, 64],
+        "transpose_backward": [0, 1, 2],
+    }
+
+    # Per-case props: same spacing before and after resampling → scaling = 1.0
+    # No crop offset (crop_bbox starts at 0 on each axis)
+    props = {
+        "original_spacing": [0.3, 0.3, 0.5],
+        "spacing_after_resampling": [0.3, 0.3, 0.5],
+        "crop_bbox": [(0, 64), (0, 64), (0, 64)],
+    }
+
+    # Synthetic storage-frame boxes: (x1,y1,x2,y2,z1,z2) with slot0→d0
+    boxes_pre = np.array(
+        [
+            [10.0, 20.0, 30.0, 40.0, 5.0, 15.0],
+            [0.0, 0.0, 5.0, 5.0, 0.0, 5.0],
+        ],
+        dtype=np.float32,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fold_dir = Path(tmpdir) / "fold0"
+        fold_dir.mkdir()
+        pre_dir = Path(tmpdir) / "preprocessed"
+        pre_dir.mkdir()
+
+        # Write plan_inference.pkl
+        with open(fold_dir / "plan_inference.pkl", "wb") as fh:
+            pickle.dump(plan, fh)
+        # Write per-case properties pkl
+        with open(pre_dir / "0007.pkl", "wb") as fh:
+            pickle.dump(props, fh)
+
+        # Mock nndet lazy imports
+
+        def _fake_restore_detection(
+            boxes: np.ndarray,
+            transpose_backward: list,
+            original_spacing: list,
+            spacing_after_resampling: list,
+            crop_bbox: list,
+            **kw: object,
+        ) -> np.ndarray:
+            return boxes.copy()
+
+        mock_restore_detection = MagicMock(side_effect=_fake_restore_detection)
+        mock_load_pickle_calls: list[tuple] = []
+
+        def _fake_load_pickle(p: str) -> object:  # noqa: S301 — test mock
+            import pickle
+
+            with open(p, "rb") as fh:
+                val = pickle.load(fh)  # noqa: S301
+            mock_load_pickle_calls.append((str(p),))
+            return val
+
+        mock_restore_mod = MagicMock()
+        mock_restore_mod.restore_detection = mock_restore_detection
+
+        mock_io_load = MagicMock()
+        mock_io_load.load_pickle = _fake_load_pickle
+
+        with patch.dict(
+            sys.modules,
+            {
+                "nndet": MagicMock(),
+                "nndet.inference": MagicMock(),
+                "nndet.inference.restore": mock_restore_mod,
+                "nndet.io": MagicMock(),
+                "nndet.io.load": mock_io_load,
+            },
+        ):
+            result = nndet_inference.restore_boxes_for_case(
+                boxes_preprocessed=boxes_pre,
+                case_id=7,
+                preprocessed_dir=str(pre_dir),
+                fold_dir=str(fold_dir),
+            )
+
+    # restore_detection was called once with all 5 required args (D01.18 contract)
+    assert mock_restore_detection.called, "restore_detection must be called"
+    call_kwargs = mock_restore_detection.call_args
+    # boxes: must be the input storage-frame boxes (identity mock returns boxes.copy())
+    np.testing.assert_array_equal(
+        call_kwargs.kwargs.get("boxes"),
+        boxes_pre,
+        err_msg="boxes arg to restore_detection must be the storage-frame input",
+    )
+    # transpose_backward must come from plan["transpose_backward"]
+    assert list(call_kwargs.kwargs.get("transpose_backward", [])) == [
+        0,
+        1,
+        2,
+    ], "transpose_backward must be loaded from plan_inference.pkl"
+    # original_spacing must come from per-case props
+    assert list(call_kwargs.kwargs.get("original_spacing", [])) == [
+        0.3,
+        0.3,
+        0.5,
+    ], "original_spacing must come from the per-case .pkl"
+    # spacing_after_resampling must come from per-case props
+    assert list(call_kwargs.kwargs.get("spacing_after_resampling", [])) == [
+        0.3,
+        0.3,
+        0.5,
+    ], "spacing_after_resampling must come from the per-case .pkl"
+    # crop_bbox must come from per-case props
+    assert list(call_kwargs.kwargs.get("crop_bbox", [])) == [
+        (0, 64),
+        (0, 64),
+        (0, 64),
+    ], "crop_bbox must come from the per-case .pkl"
+
+    # Result shape and dtype preserved (identity mock returns boxes.copy())
+    assert result.shape == boxes_pre.shape, f"Shape changed: {result.shape} vs {boxes_pre.shape}"
+    assert result.dtype == np.float32, f"dtype changed: {result.dtype}"
+
+
+def test_restore_boxes_for_case_empty_boxes_returns_empty() -> None:
+    """D01.18: restore_boxes_for_case with 0 input boxes returns empty array (no crash)."""
+    import pickle
+    import sys
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    from abus.detect import nndet_inference
+
+    boxes_empty = np.zeros((0, 6), dtype=np.float32)
+
+    plan = {"patch_size": [64, 64, 64], "transpose_backward": [0, 1, 2]}
+    props = {
+        "original_spacing": [0.3, 0.3, 0.5],
+        "spacing_after_resampling": [0.3, 0.3, 0.5],
+        "crop_bbox": [(0, 64), (0, 64), (0, 64)],
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fold_dir = Path(tmpdir) / "fold0"
+        fold_dir.mkdir()
+        pre_dir = Path(tmpdir) / "preprocessed"
+        pre_dir.mkdir()
+
+        with open(fold_dir / "plan_inference.pkl", "wb") as fh:
+            pickle.dump(plan, fh)
+        with open(pre_dir / "0000.pkl", "wb") as fh:
+            pickle.dump(props, fh)
+
+        # nndet lazy imports are not exercised — empty boxes return before restore_detection call
+        mock_restore_mod = MagicMock()
+
+        def _fake_load_pickle(p: str) -> object:  # noqa: S301 — test mock
+            import pickle
+
+            with open(p, "rb") as fh:
+                return pickle.load(fh)  # noqa: S301
+
+        mock_io_load = MagicMock()
+        mock_io_load.load_pickle = _fake_load_pickle
+
+        with patch.dict(
+            sys.modules,
+            {
+                "nndet": MagicMock(),
+                "nndet.inference": MagicMock(),
+                "nndet.inference.restore": mock_restore_mod,
+                "nndet.io": MagicMock(),
+                "nndet.io.load": mock_io_load,
+            },
+        ):
+            result = nndet_inference.restore_boxes_for_case(
+                boxes_preprocessed=boxes_empty,
+                case_id=0,
+                preprocessed_dir=str(pre_dir),
+                fold_dir=str(fold_dir),
+            )
+
+    # Empty input → empty output; restore_detection NOT called (early return)
+    assert result.shape == (0, 6), f"Expected (0,6), got {result.shape}"
+    assert (
+        not mock_restore_mod.restore_detection.called
+    ), "restore_detection must not be called for empty boxes (early return)"
+
+
+def test_restore_boxes_for_case_non_identity_transpose_backward() -> None:
+    """D01.18 SF1: axis-swap is visible when transpose_backward != identity.
+
+    Uses transpose_backward=[1,2,0] (ABUS production value derived from
+    transpose_forward=[2,0,1], i.e. max-spacing axis 2 goes first).
+
+    The real nnDetection permute_boxes([1,2,0]) on input (x1,y1,x2,y2,z1,z2):
+      output slot0 ← input axis 1 (y1/y2 pair)
+      output slot1 ← input axis 2 (z1/z2 pair)
+      output slot4 ← input axis 0 (x1/x2 pair)
+    So output = (y1, z1, y2, z2, x1, x2).
+
+    After scaling (identity here) and crop offset (zero here), the consumer
+    _raw_detections_to_candidates reads slot0→d0, slot1→d1, slot4→d2.
+    That maps: y_orig→d0, z_orig→d1, x_orig→d2 for THIS transpose — which is
+    correct because x_orig=preproc-axis2=original-d2, y_orig=preproc-axis0=original-d0,
+    z_orig=preproc-axis1=original-d1 after the inverse permutation.
+
+    This test locks the axis-swap regression by checking that restore_detection
+    is called with the correct non-identity transpose_backward from the plan file.
+    A wrong slot-mapping in the consumer would mismatch the physical axes by
+    ~0.073 mm vs ~0.476 mm (a 6.5× spacing ratio), detectable in IoU computation.
+    """
+    import pickle
+    import sys
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    from abus.detect import nndet_inference
+
+    # ABUS production transpose: transpose_forward=[2,0,1], backward=[1,2,0]
+    plan = {"patch_size": [64, 64, 64], "transpose_backward": [1, 2, 0]}
+    props = {
+        "original_spacing": [0.073, 0.200, 0.476],
+        "spacing_after_resampling": [0.3, 0.3, 0.5],  # after resampling, forward-transposed
+        "crop_bbox": [(0, 200), (0, 100), (0, 50)],
+    }
+
+    # Storage-frame boxes (preprocessed space, x=preproc-axis0, y=preproc-axis1, z=preproc-axis2)
+    boxes_pre = np.array([[10.0, 20.0, 30.0, 40.0, 5.0, 15.0]], dtype=np.float32)
+
+    captured_args: dict = {}
+
+    def _capturing_restore_detection(
+        boxes: np.ndarray,
+        transpose_backward: list,
+        original_spacing: list,
+        spacing_after_resampling: list,
+        crop_bbox: list,
+        **kw: object,
+    ) -> np.ndarray:
+        captured_args["transpose_backward"] = list(transpose_backward)
+        captured_args["original_spacing"] = list(original_spacing)
+        # Identity substitute: return boxes unchanged for shape/dtype verification
+        return boxes.copy()
+
+    mock_restore_detection = MagicMock(side_effect=_capturing_restore_detection)
+    mock_restore_mod = MagicMock()
+    mock_restore_mod.restore_detection = mock_restore_detection
+
+    def _fake_load_pickle(p: str) -> object:  # noqa: S301 — test mock
+        with open(p, "rb") as fh:
+            return pickle.load(fh)  # noqa: S301
+
+    mock_io_load = MagicMock()
+    mock_io_load.load_pickle = _fake_load_pickle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fold_dir = Path(tmpdir) / "fold0"
+        fold_dir.mkdir()
+        pre_dir = Path(tmpdir) / "preprocessed"
+        pre_dir.mkdir()
+        with open(fold_dir / "plan_inference.pkl", "wb") as fh:
+            pickle.dump(plan, fh)
+        with open(pre_dir / "0003.pkl", "wb") as fh:
+            pickle.dump(props, fh)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "nndet": MagicMock(),
+                "nndet.inference": MagicMock(),
+                "nndet.inference.restore": mock_restore_mod,
+                "nndet.io": MagicMock(),
+                "nndet.io.load": mock_io_load,
+            },
+        ):
+            result = nndet_inference.restore_boxes_for_case(
+                boxes_preprocessed=boxes_pre,
+                case_id=3,
+                preprocessed_dir=str(pre_dir),
+                fold_dir=str(fold_dir),
+            )
+
+    # Correct non-identity transpose_backward loaded from plan
+    assert captured_args.get("transpose_backward") == [
+        1,
+        2,
+        0,
+    ], f"Expected [1,2,0] (ABUS production), got {captured_args.get('transpose_backward')}"
+    # original_spacing from per-case props (not from plan)
+    assert captured_args.get("original_spacing") == pytest.approx(
+        [0.073, 0.200, 0.476]
+    ), f"original_spacing mismatch: {captured_args.get('original_spacing')}"
+    # Shape and dtype preserved
+    assert result.shape == (1, 6), f"Expected (1,6), got {result.shape}"
+    assert result.dtype == np.float32, f"Expected float32, got {result.dtype}"

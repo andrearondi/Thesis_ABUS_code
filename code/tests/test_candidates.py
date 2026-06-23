@@ -683,19 +683,22 @@ def test_generate_ensemble_candidates_raises_without_inference_fn():
 
 
 # ---------------------------------------------------------------------------
-# D01.13: box-axis conversion in _raw_detections_to_candidates
-# (x1,y1,x2,y2,z1,z2) nnDetection → project BBox (min_d0,min_d1,min_d2,max_d0,max_d1,max_d2)
+# D01.13/D01.18: box-axis conversion in _raw_detections_to_candidates
+# Input: (x1,y1,x2,y2,z1,z2) from restore_detection (RESTORED/original-grid frame)
+# Output: project BBox (min_d0,min_d1,min_d2,max_d0,max_d1,max_d2)
 # ---------------------------------------------------------------------------
 
 
 def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
-    """D01.13/D01.14: _raw_detections_to_candidates maps (x1,y1,x2,y2,z1,z2) correctly.
+    """D01.13/D01.14/D01.18: _raw_detections_to_candidates maps (x1,y1,x2,y2,z1,z2) correctly.
 
-    nnDetection box axis (D01.13, nndet/core/boxes/ops.py line 34):
+    nnDetection box format (D01.13, nndet/core/boxes/ops.py:34):
       box[0]=x1, box[1]=y1, box[2]=x2, box[3]=y2, box[4]=z1, box[5]=z2
 
-    Project BBox uses storage axes (d0,d1,d2):
-      x↔d2, y↔d1, z↔d0  (EPIC_00 axis vocabulary, decisions_log C1)
+    D01.18: boxes passed here MUST be RESTORED (output of restore_boxes_for_case).
+    After restore_detection, x/y/z map back to original storage axes: x=d0, y=d1, z=d2.
+    The transpose_forward undo means nnDetection's x (preprocessed axis 0) is
+    back at original axis 0 = project d0.
 
     D01.14: uses RawDetectionsWithEmb (real embeddings required; zero-placeholder retired).
     """
@@ -707,7 +710,7 @@ def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
 
     from abus.detect.nndet_inference import D_EMB, RawDetectionsWithEmb
 
-    # Known box in (x1,y1,x2,y2,z1,z2): x1=10, y1=20, x2=30, y2=40, z1=5, z2=15
+    # RESTORED box (x1,y1,x2,y2,z1,z2) in original-grid space: x=d0, y=d1, z=d2
     boxes = np.array([[10.0, 20.0, 30.0, 40.0, 5.0, 15.0]], dtype=np.float32)
     scores = np.array([0.9], dtype=np.float32)
     embeddings = np.zeros((1, D_EMB), dtype=np.float32)
@@ -717,15 +720,15 @@ def test_d01_13_box_axis_x1y1x2y2z1z2_maps_to_project_bbox() -> None:
 
     assert len(candidates) == 1
     bbox = candidates[0].bbox
-    # z→d0: min_d0=z1=5, max_d0=z2=15
-    assert bbox.min_d0 == 5, f"min_d0 should be z1=5, got {bbox.min_d0}"
-    assert bbox.max_d0 == 15, f"max_d0 should be z2=15, got {bbox.max_d0}"
-    # y→d1: min_d1=y1=20, max_d1=y2=40
+    # x→d0 (restored frame, slot 0): min_d0=x1=10, max_d0=x2=30
+    assert bbox.min_d0 == 10, f"min_d0 should be x1=10, got {bbox.min_d0}"
+    assert bbox.max_d0 == 30, f"max_d0 should be x2=30, got {bbox.max_d0}"
+    # y→d1 (slot 1): min_d1=y1=20, max_d1=y2=40
     assert bbox.min_d1 == 20, f"min_d1 should be y1=20, got {bbox.min_d1}"
     assert bbox.max_d1 == 40, f"max_d1 should be y2=40, got {bbox.max_d1}"
-    # x→d2: min_d2=x1=10, max_d2=x2=30
-    assert bbox.min_d2 == 10, f"min_d2 should be x1=10, got {bbox.min_d2}"
-    assert bbox.max_d2 == 30, f"max_d2 should be x2=30, got {bbox.max_d2}"
+    # z→d2 (slot 4): min_d2=z1=5, max_d2=z2=15
+    assert bbox.min_d2 == 5, f"min_d2 should be z1=5, got {bbox.min_d2}"
+    assert bbox.max_d2 == 15, f"max_d2 should be z2=15, got {bbox.max_d2}"
 
 
 def test_d01_13_train_command_includes_sweep_flag() -> None:
@@ -1017,6 +1020,7 @@ def test_d01_14b_val_test_ensemble_uses_images_ts_not_images_tr() -> None:
         split_case_ids: dict[str, list[int]],
         preprocessed_ts_dir: str,
         nndet_commit: str,
+        **kwargs: object,  # D01.17: accept pooling= and any future keyword args
     ) -> object:
         captured_preprocessed_dirs.append(preprocessed_ts_dir)
         return {}
@@ -1102,6 +1106,7 @@ def test_d01_14b_oof_branch_still_uses_images_tr() -> None:
         fold: int,
         preprocessed_dir: str,
         fold_dir: str,
+        **kwargs: object,  # D01.17: accept pooling= and any future keyword args
     ) -> object:
         captured_oof_preprocessed_dirs.append(preprocessed_dir)
         return lambda case_ids: []
@@ -1181,6 +1186,7 @@ def test_d01_14b_val_test_case_ids_are_held_out_set() -> None:
         split_case_ids: dict[str, list[int]],
         preprocessed_ts_dir: str,
         nndet_commit: str,
+        **kwargs: object,  # D01.17: accept pooling= and any future keyword args
     ) -> object:
         captured_split_case_ids.append(split_case_ids)
         return {}
@@ -1255,3 +1261,176 @@ def test_d01_14b_val_test_case_ids_are_held_out_set() -> None:
             f"D01.14b: test case_ids must not include training cases. "
             f"Found: {training_ids_in_test}"
         )
+
+
+# ===========================================================================
+# D01.18 — two-frame design: storage-frame pooling + original-grid BBox
+# ===========================================================================
+
+
+def test_d01_18_raw_detections_to_candidates_expects_restored_boxes() -> None:
+    """D01.18: _raw_detections_to_candidates expects RESTORED (original-grid) boxes.
+
+    After restore_detection, nnDetection output format is (x1, y1, x2, y2, z1, z2)
+    in ORIGINAL image space (detection.py:263).  restore_detection applies
+    permute_boxes(boxes, transpose_backward) which undoes transpose_forward, so the
+    original storage axes map back: x=d0, y=d1, z=d2.
+
+    With restored box (x1=10, y1=20, x2=30, y2=40, z1=5, z2=15) in original-grid:
+      min_d0=x1=10, max_d0=x2=30   (slot 0 → d0)
+      min_d1=y1=20, max_d1=y2=40   (slot 1 → d1)
+      min_d2=z1=5,  max_d2=z2=15   (slot 4 → d2)
+
+    D01.18 two-frame contract: rd.boxes MUST be original-grid (restored by
+    restore_boxes_for_case), not storage-frame. Storage-frame boxes have x=d2
+    (because nnDetection's transpose_forward puts the largest-spacing axis first),
+    but restore_detection undoes that permutation.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from generate_candidates import _raw_detections_to_candidates  # noqa: PLC0415
+
+    from abus.detect.nndet_inference import D_EMB, RawDetectionsWithEmb
+
+    # These are RESTORED boxes (output of restore_boxes_for_case).
+    # Format: (x1, y1, x2, y2, z1, z2) in original-grid space.
+    # x=d0, y=d1, z=d2 after restore (transpose_forward undone).
+    boxes_restored = np.array([[10.0, 20.0, 30.0, 40.0, 5.0, 15.0]], dtype=np.float32)
+    scores = np.array([0.9], dtype=np.float32)
+    embeddings = np.zeros((1, D_EMB), dtype=np.float32)
+
+    rd = RawDetectionsWithEmb(case_id=7, boxes=boxes_restored, scores=scores, embeddings=embeddings)
+    candidates = _raw_detections_to_candidates(rd, split="train", source_detectors=(0,))
+
+    assert len(candidates) == 1
+    bbox = candidates[0].bbox
+
+    # x→d0 (restored frame): slot 0 → d0
+    assert bbox.min_d0 == 10, f"D01.18: min_d0 should be x1=10 in restored frame, got {bbox.min_d0}"
+    assert bbox.max_d0 == 30, f"D01.18: max_d0 should be x2=30 in restored frame, got {bbox.max_d0}"
+    # y→d1 (restored frame): slot 1 → d1
+    assert bbox.min_d1 == 20, f"D01.18: min_d1 should be y1=20, got {bbox.min_d1}"
+    assert bbox.max_d1 == 40, f"D01.18: max_d1 should be y2=40, got {bbox.max_d1}"
+    # z→d2 (restored frame): slot 4 → d2
+    assert bbox.min_d2 == 5, f"D01.18: min_d2 should be z1=5 in restored frame, got {bbox.min_d2}"
+    assert bbox.max_d2 == 15, f"D01.18: max_d2 should be z2=15 in restored frame, got {bbox.max_d2}"
+
+
+def test_d01_18_make_oof_inference_fn_calls_restore_boxes() -> None:
+    """D01.18: _make_oof_inference_fn calls restore_boxes_for_case (not raw storage boxes).
+
+    The two-frame design requires:
+      - pool_embeddings_at_boxes receives boxes_preprocessed (storage frame)
+      - _raw_detections_to_candidates receives restored boxes (original-grid frame)
+
+    This test verifies that restore_boxes_for_case is called as part of the OOF
+    inference function path, which is the key behavioural guard for D01.18.
+    """
+    import sys
+    from pathlib import Path
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import generate_candidates  # noqa: PLC0415
+
+    restore_calls: list[dict] = []
+
+    def capturing_restore(
+        boxes_preprocessed: np.ndarray,
+        case_id: int,
+        preprocessed_dir: str,
+        fold_dir: str,
+    ) -> np.ndarray:
+        restore_calls.append(
+            {
+                "case_id": case_id,
+                "preprocessed_dir": preprocessed_dir,
+                "fold_dir": fold_dir,
+                "boxes_preprocessed": boxes_preprocessed.copy(),
+            }
+        )
+        # Return boxes with a sentinel change (add 1000 to all values) so the test
+        # can verify that the RESTORED boxes (not storage-frame boxes) reach
+        # _raw_detections_to_candidates.
+        return boxes_preprocessed + 1000.0
+
+    storage_boxes = np.array([[1.0, 2.0, 3.0, 4.0, 0.0, 1.0]], dtype=np.float32)
+
+    # Synthetic predict_oof result
+    from abus.detect.nndet_inference import D_EMB, RawDetections
+
+    def fake_predict_oof(
+        fold: int,
+        case_ids: list[int],
+        preprocessed_dir: str,
+        fold_dir: str,
+        restore: bool = False,
+    ) -> dict:
+        return {
+            5: RawDetections(
+                case_id=5,
+                boxes=storage_boxes,
+                scores=np.array([0.9], dtype=np.float32),
+                embeddings=None,
+            )
+        }
+
+    def fake_pool_embeddings(
+        fold: int,
+        case_id: int,
+        boxes_preprocessed: np.ndarray,
+        preprocessed_dir: str,
+        fold_dir: str,
+        pooling: str = "centroid",
+    ) -> np.ndarray:
+        # Verify pooling receives STORAGE-FRAME boxes (not restored boxes)
+        # i.e. storage_boxes values, not storage_boxes+1000
+        assert np.all(boxes_preprocessed < 1000), (
+            "D01.18: pool_embeddings_at_boxes must receive storage-frame boxes, "
+            "not restored boxes — the pooler works in FPN/preprocessed space."
+        )
+        return np.zeros((boxes_preprocessed.shape[0], D_EMB), dtype=np.float32)
+
+    received_boxes_in_candidates: list[np.ndarray] = []
+
+    def fake_raw_detections_to_candidates(rd: object, split: str, source_detectors: tuple) -> list:
+        received_boxes_in_candidates.append(rd.boxes.copy())  # type: ignore[attr-defined]
+        return []
+
+    with (
+        patch.object(generate_candidates, "predict_oof", fake_predict_oof),
+        patch.object(generate_candidates, "pool_embeddings_at_boxes", fake_pool_embeddings),
+        patch.object(generate_candidates, "restore_boxes_for_case", capturing_restore),
+        patch.object(
+            generate_candidates,
+            "_raw_detections_to_candidates",
+            fake_raw_detections_to_candidates,
+        ),
+    ):
+        inference_fn = generate_candidates._make_oof_inference_fn(
+            fold=0,
+            preprocessed_dir="/fake/preprocessed",
+            fold_dir="/fake/fold0",
+            pooling="centroid",
+        )
+        inference_fn([5])
+
+    # restore_boxes_for_case must have been called once (for case_id=5)
+    assert len(restore_calls) == 1, (
+        f"D01.18: restore_boxes_for_case must be called once per case, "
+        f"got {len(restore_calls)} calls"
+    )
+    assert restore_calls[0]["case_id"] == 5
+
+    # _raw_detections_to_candidates must have received RESTORED boxes (storage + 1000)
+    assert len(received_boxes_in_candidates) == 1, "_raw_detections_to_candidates not called"
+    np.testing.assert_allclose(
+        received_boxes_in_candidates[0],
+        storage_boxes + 1000.0,
+        err_msg=(
+            "D01.18: _raw_detections_to_candidates must receive RESTORED boxes "
+            "(storage_boxes + 1000 sentinel), not raw storage-frame boxes."
+        ),
+    )
