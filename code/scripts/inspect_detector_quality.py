@@ -37,6 +37,7 @@ import csv
 import json
 import logging
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -214,7 +215,18 @@ def parse_val_predictions_dir(val_pred_dir: str) -> dict[int, Any]:
 def parse_train_log(log_path: str) -> dict[str, Any]:
     """Parse a fold's train.log for convergence information.
 
-    Looks for lines containing 'training_epoch_end' and extracts loss values.
+    Extracts BOTH train and val loss curves from the two line types that
+    nnDetection (retinaunet.base) emits:
+      training_epoch_end   → "Train loss reached: <signed_float>"
+      validation_epoch_end → "Val loss reached: <signed_float>"
+
+    IMPORTANT: nnDetection's total loss goes NEGATIVE during later epochs because
+    the GIoU regression term (bounded in [-1, +1]) dominates the positive cls+seg terms.
+    Once regression converges (GIoU → +1, reg_loss → -1) and cls+seg shrink below |reg|,
+    the total crosses zero. Negative total loss is NORMAL and indicates convergence.
+    The regex must match signed floats; dropping negative-loss lines would silently
+    under-count epochs, causing false "ERROR / COMPLETE: NO" on correctly-trained folds.
+    (Root cause of server-verified bug 2026-06-24, fold3 train.log: 6-7/60 extracted.)
 
     Parameters
     ----------
@@ -226,9 +238,12 @@ def parse_train_log(log_path: str) -> dict[str, Any]:
     Dict[str, Any]
         "epochs_completed": int — count of training_epoch_end lines
         "training_complete": bool — True iff epochs_completed == EXPECTED_EPOCHS
-        "loss_per_epoch": List[float] — loss values per epoch (may be empty)
-        "final_loss": Optional[float] — last loss value, or None
-        "error": Optional[str] — set if parse failed
+        "train_loss_per_epoch": List[float] — train loss per epoch (length == epochs_completed
+            when extraction is complete, may be shorter if the log format differs)
+        "val_loss_per_epoch": List[float] — val loss per epoch (may be empty if no val lines)
+        "final_loss": Optional[float] — last TRAIN loss value, or None
+        "loss_extraction_complete": bool — True iff len(train_loss_per_epoch)==epochs_completed
+        "error": Optional[str] — set when train loss extraction genuinely under-counts
 
     Raises
     ------
@@ -240,27 +255,30 @@ def parse_train_log(log_path: str) -> dict[str, Any]:
         raise FileNotFoundError(f"train.log not found: {p}")
 
     epochs_completed = 0
-    loss_per_epoch: list[float] = []
+    train_loss_per_epoch: list[float] = []
+    val_loss_per_epoch: list[float] = []
 
     with open(p) as f:
         for line in f:
-            if "training_epoch_end" not in line:
-                continue
-            epochs_completed += 1
-            # Try to extract loss= value from the line
-            loss_val = _extract_loss_from_log_line(line)
-            if loss_val is not None:
-                loss_per_epoch.append(loss_val)
+            if "training_epoch_end" in line:
+                epochs_completed += 1
+                loss_val = _extract_train_loss_from_log_line(line)
+                if loss_val is not None:
+                    train_loss_per_epoch.append(loss_val)
+            elif "validation_epoch_end" in line:
+                loss_val = _extract_val_loss_from_log_line(line)
+                if loss_val is not None:
+                    val_loss_per_epoch.append(loss_val)
 
-    final_loss: float | None = loss_per_epoch[-1] if loss_per_epoch else None
+    # final_loss = the LAST train loss value (may be negative — that is correct)
+    final_loss: float | None = train_loss_per_epoch[-1] if train_loss_per_epoch else None
 
-    # Warn when the log contains epoch markers but loss extraction produced fewer
-    # values than epoch markers — indicates the regex didn't match some lines.
-    loss_count = len(loss_per_epoch)
-    if epochs_completed > 0 and loss_count < epochs_completed:
+    # Error only when extraction genuinely under-counts — NOT when losses are negative
+    train_count = len(train_loss_per_epoch)
+    if epochs_completed > 0 and train_count < epochs_completed:
         error_msg: str | None = (
-            f"loss extracted for only {loss_count}/{epochs_completed} epochs "
-            "(train.log format may differ from expected 'Train loss reached: <float>')"
+            f"train loss extracted for only {train_count}/{epochs_completed} epochs "
+            "(train.log format may differ from expected 'Train loss reached: <signed_float>')"
         )
     else:
         error_msg = None
@@ -268,29 +286,60 @@ def parse_train_log(log_path: str) -> dict[str, Any]:
     return {
         "epochs_completed": epochs_completed,
         "training_complete": epochs_completed == EXPECTED_EPOCHS,
-        "loss_per_epoch": loss_per_epoch,
+        "train_loss_per_epoch": train_loss_per_epoch,
+        "val_loss_per_epoch": val_loss_per_epoch,
         "final_loss": final_loss,
-        "loss_extraction_complete": loss_count == epochs_completed,
+        "loss_extraction_complete": train_count == epochs_completed,
         "error": error_msg,
     }
 
 
-def _extract_loss_from_log_line(line: str) -> float | None:
-    """Extract a loss value from a loguru-format train.log line.
+# Signed-float pattern: matches positive, negative, and scientific-notation floats.
+# Examples: 0.62712  -0.51845  -1.23e-02  3.5e+01
+_SIGNED_FLOAT_PAT = r"(-?\d+\.?\d*(?:[eE][-+]?\d+)?)"
 
-    nnDetection real format (loguru default, commit 97a58f3):
-      "... training_epoch_end | Train loss reached: 0.12345"
-    Matches the pattern 'Train loss reached: <float>' case-sensitively.
+
+def _extract_train_loss_from_log_line(line: str) -> float | None:
+    """Extract a train loss value from a loguru-format train.log line.
+
+    Real nnDetection format (server-verified 2026-06-24, commit 97a58f3):
+      "... | nndet.ptmodule.retinaunet.base:training_epoch_end:251 - Train loss reached: 0.62712"
+      "... | nndet.ptmodule.retinaunet.base:training_epoch_end:251 - Train loss reached: -0.51845"
+
+    The regex matches signed and scientific-notation floats.
+    GIoU regression term bounded in [-1, +1]; total loss crosses zero when reg dominates cls+seg.
     """
-    import re
-
-    m = re.search(r"Train loss reached:\s*([0-9]*\.?[0-9]+(?:e[-+]?[0-9]+)?)", line)
+    m = re.search(r"Train loss reached:\s*" + _SIGNED_FLOAT_PAT, line)
     if m:
         try:
             return float(m.group(1))
         except ValueError:
             pass
     return None
+
+
+def _extract_val_loss_from_log_line(line: str) -> float | None:
+    """Extract a val loss value from a loguru-format train.log line.
+
+    Real nnDetection format (server-verified 2026-06-24, commit 97a58f3):
+      "... | nndet.ptmodule.retinaunet.base:validation_epoch_end:268 - Val loss reached: 0.41603"
+
+    The regex matches signed and scientific-notation floats.
+    """
+    m = re.search(r"Val loss reached:\s*" + _SIGNED_FLOAT_PAT, line)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+# Keep the old name as an alias for backward compat with any direct callers.
+# New code should use _extract_train_loss_from_log_line.
+def _extract_loss_from_log_line(line: str) -> float | None:
+    """Deprecated alias for _extract_train_loss_from_log_line. Do not use in new code."""
+    return _extract_train_loss_from_log_line(line)
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +436,8 @@ def build_convergence_summary(fold_dirs: list[str]) -> list[dict[str, Any]]:
             summary = {
                 "epochs_completed": 0,
                 "training_complete": False,
-                "loss_per_epoch": [],
+                "train_loss_per_epoch": [],
+                "val_loss_per_epoch": [],
                 "final_loss": None,
                 "loss_extraction_complete": False,
                 "error": str(exc),
@@ -396,7 +446,8 @@ def build_convergence_summary(fold_dirs: list[str]) -> list[dict[str, Any]]:
             summary = {
                 "epochs_completed": 0,
                 "training_complete": False,
-                "loss_per_epoch": [],
+                "train_loss_per_epoch": [],
+                "val_loss_per_epoch": [],
                 "final_loss": None,
                 "loss_extraction_complete": False,
                 "error": f"Unexpected error parsing train.log: {exc}",
@@ -704,13 +755,43 @@ def print_froc_ap_table(table: list[dict[str, Any]]) -> None:
     print()
 
 
+def _is_monotone_decreasing(values: list[float], window: int = 5) -> bool:
+    """Check if a loss curve is roughly monotone-decreasing.
+
+    Uses a coarse check: the mean of the last `window` values is less than
+    the mean of the first `window` values. This is not a strict test but
+    catches obvious divergence or NaN-dominated curves.
+    """
+    if len(values) < window * 2:
+        return True  # too short to say anything meaningful
+    first_mean = sum(values[:window]) / window
+    last_mean = sum(values[-window:]) / window
+    return last_mean < first_mean
+
+
 def print_convergence_summary(summaries: list[dict[str, Any]]) -> None:
-    """Print training convergence summary to stdout."""
+    """Print training convergence summary to stdout.
+
+    For each fold, prints a brief convergence read:
+      - Epochs completed (X/60)
+      - First and last train loss (loss goes negative late in training — normal for nnDetection)
+      - Last val loss
+      - Monotone-ish decrease check (coarse sanity only)
+
+    NOTE: Negative total loss is NORMAL for nnDetection (GIoU regression term dominates
+    late in training). It indicates convergence, not a problem.
+    """
     print("=" * 80)
     print("TRAINING CONVERGENCE SUMMARY")
     print("=" * 80)
-    print(f"{'Fold':<6} {'Epochs':>8} {'Complete':>10} {'Final loss':>12} {'Status'}")
-    print("-" * 60)
+    print("NOTE: nnDetection total loss goes NEGATIVE in later epochs (GIoU regression term).")
+    print("  This is NORMAL and indicates convergence — NOT an error.")
+    print()
+    print(
+        f"{'Fold':<6} {'Epochs':>8} {'Complete':>10} "
+        f"{'First loss':>12} {'Last loss':>12} {'Last val':>12} {'Monotone':>10} {'Status'}"
+    )
+    print("-" * 80)
 
     all_complete = True
     for s in summaries:
@@ -718,33 +799,37 @@ def print_convergence_summary(summaries: list[dict[str, Any]]) -> None:
         epochs = s.get("epochs_completed", 0)
         complete = s.get("training_complete", False)
         final_loss = s.get("final_loss")
+        train_losses = s.get("train_loss_per_epoch", [])
+        val_losses = s.get("val_loss_per_epoch", [])
         error = s.get("error")
 
+        fold_str = str(fold)
+        complete_str = "YES" if complete else "NO"
+        first_loss_str = f"{train_losses[0]:.4f}" if train_losses else "N/A"
+        last_loss_str = f"{final_loss:.4f}" if final_loss is not None else "N/A"
+        last_val_str = f"{val_losses[-1]:.4f}" if val_losses else "N/A"
+        monotone_str = "OK" if _is_monotone_decreasing(train_losses) else "WARN"
+
         if error:
-            status = f"ERROR: {error[:40]}"
+            status = f"ERROR: {error[:35]}"
             all_complete = False
         elif not complete:
-            status = f"INCOMPLETE ({epochs}/{EXPECTED_EPOCHS} epochs)"
+            status = f"INCOMPLETE ({epochs}/{EXPECTED_EPOCHS})"
             all_complete = False
         else:
-            loss_str = f"{final_loss:.4f}" if final_loss is not None else "N/A"
-            status = "OK"
-            fold_str = str(fold)
-            print(
-                f"{fold_str:<6} {epochs:>8}/{EXPECTED_EPOCHS:<3} {'YES':>8}"
-                f" {loss_str:>12} {status}"
-            )
-            continue
+            status = "COMPLETE"
 
-        fold_str = str(fold)
-        loss_str = f"{final_loss:.4f}" if final_loss is not None else "N/A"
-        print(f"{fold_str:<6} {epochs:>8}/{EXPECTED_EPOCHS:<3} {'NO':>8} {loss_str:>12} {status}")
+        print(
+            f"{fold_str:<6} {epochs:>6}/{EXPECTED_EPOCHS:<3} {complete_str:>10} "
+            f"{first_loss_str:>12} {last_loss_str:>12} {last_val_str:>12} "
+            f"{monotone_str:>10} {status}"
+        )
 
     print()
     if all_complete:
-        print("All folds: training complete (60/60 epochs). Safe to proceed to Job 3a.")
+        print("All folds: training COMPLETE (60/60 epochs). Safe to proceed to Job 3a.")
     else:
-        print("WARNING: Some folds are INCOMPLETE. Do NOT proceed to Job 3a.")
+        print("WARNING: Some folds are INCOMPLETE or errored. Do NOT proceed to Job 3a.")
     print()
 
 
@@ -754,7 +839,13 @@ def print_convergence_summary(summaries: list[dict[str, Any]]) -> None:
 
 
 def dump_loss_csv(summaries: list[dict[str, Any]], csv_path: str) -> None:
-    """Dump per-epoch loss values to CSV for external plotting.
+    """Dump per-epoch train and val loss values to CSV for external plotting.
+
+    CSV columns: epoch, fold0_train_loss, fold0_val_loss, fold1_train_loss, ...
+    (one train_loss and one val_loss column per fold)
+
+    This replaces the old single-column-per-fold scheme so both curves are available
+    for plotting. Negative loss values are written as-is (normal nnDetection behavior).
 
     Parameters
     ----------
@@ -763,19 +854,24 @@ def dump_loss_csv(summaries: list[dict[str, Any]], csv_path: str) -> None:
     csv_path : str
         Output path for the CSV file.
     """
+    max_train_epochs = max((len(s.get("train_loss_per_epoch", [])) for s in summaries), default=0)
+    max_val_epochs = max((len(s.get("val_loss_per_epoch", [])) for s in summaries), default=0)
+    max_epochs = max(max_train_epochs, max_val_epochs)
+
+    if max_epochs == 0:
+        logger.info("No loss data to dump.")
+        return
+
     rows = []
-    max_epochs = max((len(s.get("loss_per_epoch", [])) for s in summaries), default=0)
     for ep in range(max_epochs):
         row: dict[str, Any] = {"epoch": ep + 1}
         for s in summaries:
             fold = s.get("fold", "?")
-            losses = s.get("loss_per_epoch", [])
-            row[f"fold{fold}_loss"] = losses[ep] if ep < len(losses) else ""
+            train_losses = s.get("train_loss_per_epoch", [])
+            val_losses = s.get("val_loss_per_epoch", [])
+            row[f"fold{fold}_train_loss"] = train_losses[ep] if ep < len(train_losses) else ""
+            row[f"fold{fold}_val_loss"] = val_losses[ep] if ep < len(val_losses) else ""
         rows.append(row)
-
-    if not rows:
-        logger.info("No loss data to dump.")
-        return
 
     out = Path(csv_path)
     out.parent.mkdir(parents=True, exist_ok=True)

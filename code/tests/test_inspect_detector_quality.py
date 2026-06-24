@@ -190,27 +190,64 @@ def _make_train_log(
     tmpdir: Path,
     n_epochs: int = 60,
     plateau_at: int = 50,
+    include_negative: bool = True,
+    include_val: bool = True,
 ) -> Path:
-    """Write a synthetic train.log replicating the real nnDetection loguru format.
+    """Write a synthetic train.log replicating the REAL nnDetection loguru format.
 
-    Real format (commit 97a58f3, loguru default):
-      "2026-01-01 00:01:00 | INFO | nndet.training.trainer:training_epoch_end:311
-       | training_epoch_end | Train loss reached: 0.1234"
-    The parser looks for "training_epoch_end" on the line AND
-    "Train loss reached: <float>" for the loss value.
+    Real format (server-verified 2026-06-24, fold3 train.log, commit 97a58f3):
+      Training:
+        "... | nndet.ptmodule.retinaunet.base:training_epoch_end:251 - Train loss reached: 0.62712"
+      Validation:
+        "... | nndet.ptmodule.retinaunet.base:validation_epoch_end:268 - Val loss reached: 0.41603"
+
+    CRITICAL: nnDetection total loss goes NEGATIVE in later epochs due to the GIoU
+    regression term. This is NORMAL and indicates convergence.  The fixture now
+    includes negative loss values by default so tests cover the real server behavior.
+
+    Parameters
+    ----------
+    tmpdir : Path
+        Directory to write train.log.
+    n_epochs : int
+        Total number of epochs to simulate.
+    plateau_at : int
+        Epoch at which training loss plateaus before going negative.
+    include_negative : bool
+        If True, simulate losses going negative (as in real nnDetection).
+    include_val : bool
+        If True, include validation epoch lines ("Val loss reached:") after each
+        training epoch line.
     """
     lines = []
     for ep in range(1, n_epochs + 1):
-        # Simulate decreasing loss with plateau
+        # Phase 1: decreasing positive loss
+        # Phase 2: cross zero and go negative (GIoU dominates late in training)
         if ep <= plateau_at:
-            loss = max(0.05, 1.0 - ep * 0.017)
+            train_loss = 1.0 - ep * 0.017
         else:
-            loss = max(0.05, 1.0 - plateau_at * 0.017)  # plateaued
+            # Goes negative after plateau_at — GIoU term dominates
+            extra = ep - plateau_at
+            base = 1.0 - plateau_at * 0.017
+            train_loss = base - extra * 0.025  # goes negative around ep ~60
+
+        if not include_negative:
+            train_loss = max(0.05, train_loss)
+
         lines.append(
-            f"2026-01-01 00:{ep:02d}:00.000 | INFO     | "
-            f"nndet.training.trainer:training_epoch_end:311 | "
-            f"training_epoch_end | Train loss reached: {loss:.4f}"
+            f"2026-01-01 00:{ep % 60:02d}:00.000 | INFO     | "
+            f"nndet.ptmodule.retinaunet.base:training_epoch_end:251 | "
+            f"Train loss reached: {train_loss:.5f}"
         )
+
+        if include_val:
+            # Validation loss: typically lower in magnitude, also may go negative
+            val_loss = train_loss * 0.8 - 0.05
+            lines.append(
+                f"2026-01-01 00:{ep % 60:02d}:00.500 | INFO     | "
+                f"nndet.ptmodule.retinaunet.base:validation_epoch_end:268 | "
+                f"Val loss reached: {val_loss:.5f}"
+            )
 
     path = tmpdir / "train.log"
     path.write_text("\n".join(lines) + "\n")
@@ -436,7 +473,13 @@ class TestParseValPredictionsDir:
 
 
 class TestParseTrainLog:
-    """Tests for train.log convergence parser."""
+    """Tests for train.log convergence parser.
+
+    Fixture (_make_train_log with defaults) now replicates the REAL server format:
+    - training_epoch_end lines with "Train loss reached: <signed float>"
+    - validation_epoch_end lines with "Val loss reached: <signed float>"
+    - Loss goes NEGATIVE in later epochs (GIoU term) — this is normal nnDetection behavior.
+    """
 
     def test_counts_training_epoch_end_lines(self, tmp_path: Path) -> None:
         """Parser counts lines containing 'training_epoch_end'."""
@@ -463,16 +506,91 @@ class TestParseTrainLog:
         result = parse_train_log(str(log_path))
         assert result["training_complete"] is True
 
-    def test_extracts_loss_per_epoch(self, tmp_path: Path) -> None:
-        """Loss values per epoch are extracted into a list."""
+    def test_extracts_train_loss_per_epoch(self, tmp_path: Path) -> None:
+        """Train loss values per epoch are extracted into a list of length n_epochs."""
         from inspect_detector_quality import parse_train_log
 
         log_path = _make_train_log(tmp_path, n_epochs=60)
         result = parse_train_log(str(log_path))
-        assert "loss_per_epoch" in result
-        assert len(result["loss_per_epoch"]) == 60
-        # Each element is a float
-        assert all(isinstance(v, float) for v in result["loss_per_epoch"])
+        assert "train_loss_per_epoch" in result
+        assert len(result["train_loss_per_epoch"]) == 60
+        assert all(isinstance(v, float) for v in result["train_loss_per_epoch"])
+
+    def test_extracts_val_loss_per_epoch(self, tmp_path: Path) -> None:
+        """Val loss values per epoch are extracted into a list of length n_epochs."""
+        from inspect_detector_quality import parse_train_log
+
+        log_path = _make_train_log(tmp_path, n_epochs=60, include_val=True)
+        result = parse_train_log(str(log_path))
+        assert "val_loss_per_epoch" in result
+        assert len(result["val_loss_per_epoch"]) == 60
+        assert all(isinstance(v, float) for v in result["val_loss_per_epoch"])
+
+    def test_negative_train_loss_not_dropped(self, tmp_path: Path) -> None:
+        """Regression: negative loss epochs must NOT be dropped.
+
+        nnDetection total loss goes negative late in training (GIoU regression term).
+        The old regex only matched positive floats, causing 6-7/60 epochs to be
+        extracted on the real server. With the fix all 60 must be present.
+        """
+        from inspect_detector_quality import parse_train_log
+
+        log_path = _make_train_log(tmp_path, n_epochs=60, include_negative=True)
+        result = parse_train_log(str(log_path))
+        # All 60 train loss epochs must be extracted — none dropped due to negative sign
+        assert len(result["train_loss_per_epoch"]) == 60, (
+            f"Expected 60 train loss values, got {len(result['train_loss_per_epoch'])}. "
+            "Negative-loss epochs are being dropped — fix the regex."
+        )
+        # At least some must be negative (GIoU behavior after plateau)
+        n_negative = sum(1 for v in result["train_loss_per_epoch"] if v < 0)
+        assert n_negative > 0, "No negative losses found — fixture is not producing them"
+
+    def test_final_loss_is_last_value_not_last_positive(self, tmp_path: Path) -> None:
+        """final_loss must be the LAST train loss, even if it's negative.
+
+        Old code took the last positive value, so with negative losses at the end
+        final_loss was wrong (it was the last positive epoch, not the final epoch).
+        """
+        from inspect_detector_quality import parse_train_log
+
+        log_path = _make_train_log(tmp_path, n_epochs=60, include_negative=True)
+        result = parse_train_log(str(log_path))
+        # The final loss must equal the last extracted value
+        assert result["final_loss"] == result["train_loss_per_epoch"][-1]
+        # And for 60-epoch run with going negative, the final value must be negative
+        assert result["final_loss"] is not None
+        assert result["final_loss"] < 0, (
+            "With include_negative=True over 60 epochs, final_loss should be negative. "
+            "old code was returning the last POSITIVE value."
+        )
+
+    def test_convergence_complete_60_epochs_no_error(self, tmp_path: Path) -> None:
+        """60/60 epochs with all losses extracted: no error, status COMPLETE.
+
+        Regression: old code set error='loss extracted for only N/60 epochs' when
+        negative losses were dropped, making the convergence summary say ERROR/COMPLETE:NO
+        for correctly-trained folds.
+        """
+        from inspect_detector_quality import parse_train_log
+
+        log_path = _make_train_log(tmp_path, n_epochs=60, include_negative=True)
+        result = parse_train_log(str(log_path))
+        assert result["training_complete"] is True
+        assert result["loss_extraction_complete"] is True
+        assert (
+            result["error"] is None
+        ), f"Expected no error for a complete 60-epoch log, got: {result['error']!r}"
+
+    def test_negative_val_loss_not_dropped(self, tmp_path: Path) -> None:
+        """Regression: negative val loss epochs must not be dropped."""
+        from inspect_detector_quality import parse_train_log
+
+        log_path = _make_train_log(tmp_path, n_epochs=60, include_negative=True, include_val=True)
+        result = parse_train_log(str(log_path))
+        assert (
+            len(result["val_loss_per_epoch"]) == 60
+        ), f"Expected 60 val loss values, got {len(result['val_loss_per_epoch'])}."
 
     def test_missing_log_raises(self, tmp_path: Path) -> None:
         """FileNotFoundError for a missing train.log."""
@@ -490,6 +608,31 @@ class TestParseTrainLog:
         result = parse_train_log(str(log_path))
         assert result["epochs_completed"] == 0
         assert result["training_complete"] is False
+
+    def test_no_val_lines_val_loss_empty(self, tmp_path: Path) -> None:
+        """Log with no 'Val loss reached:' lines produces an empty val_loss_per_epoch."""
+        from inspect_detector_quality import parse_train_log
+
+        log_path = _make_train_log(tmp_path, n_epochs=10, include_val=False)
+        result = parse_train_log(str(log_path))
+        assert result["val_loss_per_epoch"] == []
+
+    def test_scientific_notation_loss_parsed(self, tmp_path: Path) -> None:
+        """Losses in scientific notation (e.g. -1.23e-02) must be parsed."""
+        from inspect_detector_quality import parse_train_log
+
+        # Write a log with a scientific-notation loss value
+        line = (
+            "2026-01-01 00:01:00.000 | INFO     | "
+            "nndet.ptmodule.retinaunet.base:training_epoch_end:251 | "
+            "Train loss reached: -1.23e-02"
+        )
+        log_path = tmp_path / "train.log"
+        log_path.write_text(line + "\n")
+        result = parse_train_log(str(log_path))
+        assert result["epochs_completed"] == 1
+        assert len(result["train_loss_per_epoch"]) == 1
+        assert abs(result["train_loss_per_epoch"][0] - (-0.0123)) < 1e-9
 
 
 # ===========================================================================
@@ -604,7 +747,7 @@ class TestBuildConvergenceSummary:
         assert len(summaries) == 5
 
     def test_complete_fold_marked(self, tmp_path: Path) -> None:
-        """Fold with 60/60 epochs is marked training_complete=True."""
+        """Fold with 60/60 epochs is marked training_complete=True with no error."""
         from inspect_detector_quality import build_convergence_summary
 
         fd = tmp_path / "fold0"
@@ -613,6 +756,8 @@ class TestBuildConvergenceSummary:
         summaries = build_convergence_summary([str(fd)])
         assert summaries[0]["training_complete"] is True
         assert summaries[0]["epochs_completed"] == 60
+        # Regression: must be error-free even with negative losses
+        assert summaries[0]["error"] is None
 
     def test_incomplete_fold_marked(self, tmp_path: Path) -> None:
         """Fold with fewer than 60 epochs is marked training_complete=False."""
@@ -979,16 +1124,20 @@ class TestRegressionS3S4:
         assert pooled["min_n_folds"] == 5
 
     def test_loss_extraction_mismatch_flagged_in_error(self, tmp_path: Path) -> None:
-        """When loss extraction produces fewer values than epoch markers, error is set (S2)."""
+        """When train loss extraction under-counts relative to epoch markers, error is set (S2).
+
+        This should ONLY fire when extraction genuinely fails (no 'Train loss reached:' lines),
+        NOT when losses are negative (negative loss is normal nnDetection behavior).
+        """
         from inspect_detector_quality import parse_train_log
 
-        # Write a log with epoch markers but no loss lines
+        # Write a log with epoch markers but NO loss values at all
         lines = []
         for ep in range(10):
             lines.append(
                 f"2026-01-01 00:{ep:02d}:00 | INFO | "
-                f"nndet.training.trainer:training_epoch_end:311 | "
-                f"training_epoch_end | some other message"
+                f"nndet.ptmodule.retinaunet.base:training_epoch_end:251 | "
+                f"some other message (no loss line)"
             )
         log_path = tmp_path / "train.log"
         log_path.write_text("\n".join(lines) + "\n")
